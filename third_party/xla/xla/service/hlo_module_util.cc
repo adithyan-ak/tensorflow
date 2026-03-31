@@ -62,31 +62,33 @@ absl::Status ValidateResultShape(const Shape& client_shape,
 
 absl::StatusOr<std::unique_ptr<HloModule>> CreateModuleFromString(
     const absl::string_view hlo_string, const DebugOptions& debug_options,
-    const HloParserOptions& parser_options) {
+    const HloParserOptions& parser_options, std::optional<int64_t> module_id) {
   HloModuleConfig config;
   config.set_debug_options(debug_options);
-  return ParseAndReturnUnverifiedModule(hlo_string, config, parser_options);
+  return ParseAndReturnUnverifiedModule(hlo_string, config, parser_options,
+                                        module_id);
 }
 
 absl::StatusOr<std::unique_ptr<HloModule>> CreateModuleFromProto(
-    const HloModuleProto& proto, const DebugOptions& debug_options) {
+    const HloModuleProto& proto, const DebugOptions& debug_options,
+    std::optional<int64_t> module_id) {
   TF_ASSIGN_OR_RETURN(
       HloModuleConfig config,
       HloModule::CreateModuleConfigFromProto(proto, debug_options));
-  return HloModule::CreateFromProto(proto, config,
-                                    /*buffer_assignment_proto=*/nullptr,
-                                    /*preserve_instruction_ids=*/false);
+  return HloModule::CreateFromProto(
+      proto, config, /*buffer_assignment_proto=*/nullptr,
+      /*preserve_instruction_ids=*/false, module_id);
 }
 
 absl::StatusOr<std::unique_ptr<HloModule>> CreateModuleFromProto(
     const HloModuleProto& proto, const HloModuleConfig& module_config,
-    bool is_module_post_optimizations) {
+    bool is_module_post_optimizations, std::optional<int64_t> module_id) {
   VLOG(4) << proto.ShortDebugString();
-  TF_ASSIGN_OR_RETURN(
-      std::unique_ptr<HloModule> module,
-      HloModule::CreateFromProto(proto, module_config,
-                                 /*buffer_assignment_proto=*/nullptr,
-                                 /*preserve_instruction_ids=*/false));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> module,
+                      HloModule::CreateFromProto(
+                          proto, module_config,
+                          /*buffer_assignment_proto=*/nullptr,
+                          /*preserve_instruction_ids=*/false, module_id));
   TF_RETURN_IF_ERROR(
       HloVerifier(/*layout_sensitive=*/false,
                   /*allow_mixed_precision=*/is_module_post_optimizations)
@@ -97,39 +99,41 @@ absl::StatusOr<std::unique_ptr<HloModule>> CreateModuleFromProto(
 
 absl::StatusOr<std::unique_ptr<HloModule>> ReadModuleFromBinaryProtoFile(
     absl::string_view filename, const DebugOptions& debug_options,
-    bool remap_instruction_ids) {
+    bool remap_instruction_ids, std::optional<int64_t> module_id) {
   HloProto proto;
   TF_RETURN_IF_ERROR(
       tsl::ReadBinaryProto(tsl::Env::Default(), std::string(filename), &proto));
   if (remap_instruction_ids) {
     TF_ASSIGN_OR_RETURN(HloModuleProto sanitized_proto,
                         HloModule::RemapInstructionIds(proto.hlo_module()));
-    return CreateModuleFromProto(sanitized_proto, debug_options);
+    return CreateModuleFromProto(sanitized_proto, debug_options, module_id);
   }
-  return CreateModuleFromProto(proto.hlo_module(), debug_options);
+  return CreateModuleFromProto(proto.hlo_module(), debug_options, module_id);
 }
 
 absl::StatusOr<std::unique_ptr<HloModule>> ReadModuleFromHloTextFile(
     absl::string_view filename, const DebugOptions& debug_options,
-    const HloParserOptions& options) {
+    const HloParserOptions& options, std::optional<int64_t> module_id) {
   std::string hlo_string;
   TF_RETURN_IF_ERROR(tsl::ReadFileToString(tsl::Env::Default(),
                                            std::string(filename), &hlo_string));
   HloModuleConfig config;
   config.set_debug_options(debug_options);
-  return ParseAndReturnUnverifiedModule(hlo_string, config, options);
+  return ParseAndReturnUnverifiedModule(hlo_string, config, options, module_id);
 }
 
 absl::StatusOr<std::unique_ptr<HloModule>> ReadModuleFromTextProtoFile(
-    absl::string_view hlo_file, const DebugOptions& debug_options) {
+    absl::string_view hlo_file, const DebugOptions& debug_options,
+    std::optional<int64_t> module_id) {
   HloProto proto;
   TF_RETURN_IF_ERROR(
       tsl::ReadTextProto(tsl::Env::Default(), std::string(hlo_file), &proto));
-  return CreateModuleFromProto(proto.hlo_module(), debug_options);
+  return CreateModuleFromProto(proto.hlo_module(), debug_options, module_id);
 }
 
 absl::StatusOr<std::unique_ptr<HloModule>> ReadModuleFromModuleBinaryProtofile(
-    absl::string_view filename, const DebugOptions& debug_options) {
+    absl::string_view filename, const DebugOptions& debug_options,
+    std::optional<int64_t> module_id) {
   HloModuleProto module_proto;
   TF_RETURN_IF_ERROR(tsl::ReadBinaryProto(
       tsl::Env::Default(), std::string(filename), &module_proto));
@@ -140,11 +144,13 @@ absl::StatusOr<std::unique_ptr<HloModule>> ReadModuleFromModuleBinaryProtofile(
 
   return HloModule::CreateFromProto(module_proto, module_config,
                                     /*buffer_assignment_proto=*/nullptr,
-                                    /*preserve_instruction_ids=*/false);
+                                    /*preserve_instruction_ids=*/false,
+                                    module_id);
 }
 
 absl::StatusOr<std::unique_ptr<HloModule>> ReadModuleFromModuleTextProtoFile(
-    absl::string_view hlo_file, const DebugOptions& debug_options) {
+    absl::string_view hlo_file, const DebugOptions& debug_options,
+    std::optional<int64_t> module_id) {
   HloModuleProto module_proto;
   TF_RETURN_IF_ERROR(tsl::ReadTextProto(tsl::Env::Default(),
                                         std::string(hlo_file), &module_proto));
@@ -155,7 +161,8 @@ absl::StatusOr<std::unique_ptr<HloModule>> ReadModuleFromModuleTextProtoFile(
 
   return HloModule::CreateFromProto(module_proto, module_config,
                                     /*buffer_assignment_proto=*/nullptr,
-                                    /*preserve_instruction_ids=*/false);
+                                    /*preserve_instruction_ids=*/false,
+                                    module_id);
 }
 
 absl::StatusOr<std::unique_ptr<HloModuleConfig>> CreateModuleConfig(

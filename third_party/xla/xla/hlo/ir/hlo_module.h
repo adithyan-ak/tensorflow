@@ -93,16 +93,19 @@ using NumericOrString = std::variant<std::string, int64_t, double>;
 // attached to.
 class HloModule {
  public:
-  HloModule(const std::string& name, HloModuleConfig config);
+  HloModule(const std::string& name, HloModuleConfig config,
+            std::optional<int> module_id = std::nullopt);
   // REQUIRED: comp_envs must not be null.
   HloModule(const std::string& name, HloModuleConfig config,
-            std::unique_ptr<CompilationEnvironments> comp_envs);
+            std::unique_ptr<CompilationEnvironments> comp_envs,
+            std::optional<int> module_id = std::nullopt);
 
   // You can share a config from other modules by passing
   // HloModule::shared_config()
   HloModule(const std::string& name,
             std::shared_ptr<const HloModuleConfig> config,
-            std::unique_ptr<CompilationEnvironments> comp_envs);
+            std::unique_ptr<CompilationEnvironments> comp_envs,
+            std::optional<int> module_id = std::nullopt);
   virtual ~HloModule();
 
   // Adds an entry computation to the module. A module can only have one entry
@@ -451,6 +454,8 @@ class HloModule {
     return config_;
   }
 
+  static int NextUniqueModuleId() { return next_unique_module_id_++; }
+
   bool is_dynamic() const { return is_dynamic_; }
   void set_is_dynamic(bool is_dynamic) { is_dynamic_ = is_dynamic; }
 
@@ -549,12 +554,14 @@ class HloModule {
       bool prohibit_empty_literal = true,
       std::unique_ptr<CompilationEnvironments> comp_envs = nullptr,
       bool preserve_instruction_ids = true,
-      BufferAssignmentProto* buffer_assignment_proto = nullptr);
+      BufferAssignmentProto* buffer_assignment_proto = nullptr,
+      std::optional<int> module_id = std::nullopt);
 
   static absl::StatusOr<std::unique_ptr<HloModule>> CreateFromProto(
       const HloModuleProto& proto, const HloModuleConfig& module_config,
       BufferAssignmentProto* buffer_assignment_proto,
-      bool preserve_instruction_ids = true);
+      bool preserve_instruction_ids = true,
+      std::optional<int> module_id = std::nullopt);
 
   // Convert an HloModule to or from a proto that includes module configuration
   void ToProtoWithConfig(HloModuleProtoWithConfig* proto) const;
@@ -568,12 +575,14 @@ class HloModule {
       const HloModuleProtoWithConfig& proto, bool prohibit_empty_literal = true,
       std::unique_ptr<CompilationEnvironments> comp_envs = nullptr,
       bool preserve_instruction_ids = true,
-      BufferAssignmentProto* buffer_assignment_proto = nullptr);
+      BufferAssignmentProto* buffer_assignment_proto = nullptr,
+      std::optional<int> module_id = std::nullopt);
 
   static absl::StatusOr<std::unique_ptr<HloModule>> CreateFromProtoWithConfig(
       const HloModuleProtoWithConfig& proto,
       BufferAssignmentProto* buffer_assignment_proto,
-      bool preserve_instruction_ids = true);
+      bool preserve_instruction_ids = true,
+      std::optional<int> module_id = std::nullopt);
 
   // Creates and returns an HloModuleConfig with an appropriate program shape
   // for the HLO module in the given proto.

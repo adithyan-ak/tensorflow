@@ -15,7 +15,9 @@ limitations under the License.
 
 #include "xla/service/local_service.h"
 
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -75,7 +77,8 @@ absl::StatusOr<std::vector<std::unique_ptr<Executable>>>
 LocalService::CompileExecutables(
     const XlaComputation& computation,
     const absl::Span<const Shape* const> argument_layouts,
-    const ExecutableBuildOptions& build_options) {
+    const ExecutableBuildOptions& build_options,
+    std::optional<int64_t> module_id) {
   TF_ASSIGN_OR_RETURN(
       std::unique_ptr<HloModuleConfig> module_config,
       GetHloModuleConfig(computation, argument_layouts, build_options,
@@ -106,7 +109,7 @@ LocalService::CompileExecutables(
         std::unique_ptr<Executable> executable,
         BuildExecutable(computation.proto(), std::move(module_config),
                         execute_backend_.get(), executor, compile_options,
-                        build_options.run_backend_only()));
+                        build_options.run_backend_only(), module_id));
     std::vector<std::unique_ptr<Executable>> executables;
     executables.push_back(std::move(executable));
     return executables;
@@ -118,7 +121,7 @@ LocalService::CompileExecutables(
     return BuildExecutables(
         /*module_proto=*/&computation.proto(), std::move(module_config),
         execute_backend_.get(), {executors}, compile_options,
-        build_options.run_backend_only());
+        build_options.run_backend_only(), module_id);
   }
 }
 

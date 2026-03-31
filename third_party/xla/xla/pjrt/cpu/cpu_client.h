@@ -298,7 +298,8 @@ class PjRtCpuClient final : public CommonPjRtClient {
       const std::vector<const Shape*>& argument_layout_pointers,
       LayoutCanonicalizationCallback layout_canonicalization_callback,
       CompileOptions options,
-      const AotCompilationOptions* absl_nullable aot_options = nullptr);
+      const AotCompilationOptions* absl_nullable aot_options = nullptr,
+      std::optional<int64_t> module_id = std::nullopt);
 
   absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>> LoadInternal(
       std::shared_ptr<PjRtCpuExecutable> cpu_executable,

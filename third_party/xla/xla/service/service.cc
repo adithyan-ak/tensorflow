@@ -270,13 +270,13 @@ Service::BuildExecutables(const HloModuleProto* module_proto,
                           Backend* backend,
                           std::vector<se::StreamExecutor*> executors,
                           const Compiler::CompileOptions& options,
-                          bool run_backend_only) {
+                          bool run_backend_only, int64_t module_id) {
   VLOG(1) << StrFormat("BuildExecutable on service %p", this);
   VLOG(1) << "Computation :" << module_proto->name();
 
-  TF_ASSIGN_OR_RETURN(
-      auto module,
-      CreateModuleFromProto(*module_proto, *module_config, run_backend_only));
+  TF_ASSIGN_OR_RETURN(auto module,
+                      CreateModuleFromProto(*module_proto, *module_config,
+                                            run_backend_only, module_id));
   module->set_layout_canonicalization_callback(
       options.layout_canonicalization_callback);
   UpdateEntryComputationLayout(

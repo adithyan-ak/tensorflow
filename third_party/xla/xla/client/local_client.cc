@@ -16,7 +16,9 @@ limitations under the License.
 #include "xla/client/local_client.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -436,12 +438,14 @@ static absl::StatusOr<ExecutableBuildOptions> UpdateBuildOptions(
 absl::StatusOr<std::vector<std::unique_ptr<LocalExecutable>>>
 LocalClient::Compile(const XlaComputation& computation,
                      const absl::Span<const Shape* const> argument_layouts,
-                     const ExecutableBuildOptions& options) {
+                     const ExecutableBuildOptions& options,
+                     std::optional<int> module_id) {
   TF_ASSIGN_OR_RETURN(ExecutableBuildOptions updated_options,
                       UpdateBuildOptions(options, default_device_ordinal()));
-  TF_ASSIGN_OR_RETURN(std::vector<std::unique_ptr<Executable>> executables,
-                      local_service_->CompileExecutables(
-                          computation, argument_layouts, updated_options));
+  TF_ASSIGN_OR_RETURN(
+      std::vector<std::unique_ptr<Executable>> executables,
+      local_service_->CompileExecutables(computation, argument_layouts,
+                                         updated_options, module_id));
 
   std::vector<std::unique_ptr<LocalExecutable>> local_executables;
   local_executables.reserve(executables.size());

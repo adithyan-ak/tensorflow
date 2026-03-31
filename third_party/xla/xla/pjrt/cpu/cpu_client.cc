@@ -629,8 +629,9 @@ absl::StatusOr<std::pair<std::unique_ptr<PjRtCpuExecutable>,
                          std::shared_ptr<DeviceAssignment>>>
 PjRtCpuClient::CompileAndAssignDevices(MaybeOwningMlirModule module,
                                        CompileOptions options) {
-  TF_RETURN_IF_ERROR(
-      pjrt::MaybeDumpCompileInputs(options, module.mlir_module(), *topology_));
+  int module_id = xla::HloModule::NextUniqueModuleId();
+  TF_RETURN_IF_ERROR(pjrt::MaybeDumpCompileInputs(options, module.mlir_module(),
+                                                  *topology_, module_id));
 
   XlaComputation xla_computation;
   ExecutableBuildOptions& exec_build_options = options.executable_build_options;
@@ -677,7 +678,8 @@ PjRtCpuClient::CompileAndAssignDevices(MaybeOwningMlirModule module,
                        options.executable_build_options));
 
   return CompileInternal(xla_computation, arg_layouts_and_pointers.second,
-                         layout_callback, options);
+                         layout_callback, options, /*aot_options=*/nullptr,
+                         std::make_optional(module_id));
 }
 
 absl::StatusOr<std::pair<std::unique_ptr<PjRtCpuExecutable>,
@@ -787,7 +789,8 @@ PjRtCpuClient::CompileInternal(
     const std::vector<const Shape*>& argument_layout_pointers,
     LayoutCanonicalizationCallback layout_canonicalization_callback,
     CompileOptions options,
-    const AotCompilationOptions* absl_nullable aot_options) {
+    const AotCompilationOptions* absl_nullable aot_options,
+    std::optional<int64_t> module_id) {
   tsl::profiler::TraceMe traceme("PjRtCpuClient::Compile");
   auto input_options = options;
 
@@ -867,9 +870,13 @@ PjRtCpuClient::CompileInternal(
 
   // Unoptimized HloModule.
   const xla::HloModuleProto& hlo_module_proto = computation.proto();
-  TF_ASSIGN_OR_RETURN(
-      std::unique_ptr<HloModule> hlo_module,
-      xla::HloModule::CreateFromProto(hlo_module_proto, *hlo_module_config));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> hlo_module,
+                      xla::HloModule::CreateFromProto(
+                          hlo_module_proto, *hlo_module_config,
+                          /*prohibit_empty_literal=*/false,
+                          /*comp_envs=*/nullptr,
+                          /*preserve_instruction_ids=*/false,
+                          /*buffer_assignment_proto=*/nullptr, module_id));
 
   if (aot_options) {
     TF_ASSIGN_OR_RETURN(cpu_executable,

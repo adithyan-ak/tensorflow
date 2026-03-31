@@ -99,6 +99,15 @@ TEST(HloModuleTest, AbslHashValue) {
   EXPECT_NE(absl::HashOf(module1), absl::HashOf(*module4));
 }
 
+TEST(HloModuleTest, PreassignedUniqueId) {
+  int preassigned_id = HloModule::NextUniqueModuleId();
+  HloModule module("m1", HloModuleConfig(), preassigned_id);
+  EXPECT_EQ(module.unique_id(), preassigned_id);
+  HloModule module2("m2", HloModuleConfig());
+  // Should not be equal to the preassigned id.
+  EXPECT_GT(module2.unique_id(), preassigned_id);
+}
+
 TEST(HloModuleTest, ToFingerprint) {
   auto fp = [](const HloModule& module,
                std::optional<absl::btree_map<std::string, NumericOrString>>

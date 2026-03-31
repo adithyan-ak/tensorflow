@@ -16,7 +16,9 @@ limitations under the License.
 #ifndef XLA_HLO_PARSER_HLO_PARSER_H_
 #define XLA_HLO_PARSER_HLO_PARSER_H_
 
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -77,7 +79,8 @@ class HloParserOptions {
 // ParseAndReturnVerifiedModule() instead!
 absl::StatusOr<std::unique_ptr<HloModule>> ParseAndReturnUnverifiedModule(
     absl::string_view str, const HloModuleConfig& config = HloModuleConfig(),
-    const HloParserOptions& options = HloParserOptions());
+    const HloParserOptions& options = HloParserOptions(),
+    std::optional<int> module_id = std::nullopt);
 
 // Parses sharding from str. str is supposed to contain the body of the
 // sharding, i.e. just the rhs of the "sharding={...}" attribute string, e.g.,
@@ -147,7 +150,8 @@ class HloParser {
  private:
   static std::unique_ptr<HloParser> CreateHloParserForTests(
       absl::string_view str,
-      const HloParserOptions& options = HloParserOptions());
+      const HloParserOptions& options = HloParserOptions(),
+      std::optional<int> module_id = std::nullopt);
   friend class VerifiedHloModule;
 };
 

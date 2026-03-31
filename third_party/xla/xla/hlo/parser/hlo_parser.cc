@@ -8302,8 +8302,8 @@ bool HloParserImpl::ParseSingleInstruction(HloModule* module) {
 
 absl::StatusOr<std::unique_ptr<HloModule>> ParseAndReturnUnverifiedModule(
     absl::string_view str, const HloModuleConfig& config,
-    const HloParserOptions& options) {
-  auto module = std::make_unique<HloModule>(/*name=*/"_", config);
+    const HloParserOptions& options, std::optional<int> module_id) {
+  auto module = std::make_unique<HloModule>(/*name=*/"_", config, module_id);
   HloParserImpl parser(str, options);
   TF_RETURN_IF_ERROR(parser.Run(module.get()));
   return module;
@@ -8388,7 +8388,8 @@ ParseCollectiveDeviceListBase(absl::string_view str) {
 }
 
 std::unique_ptr<HloParser> HloParser::CreateHloParserForTests(
-    absl::string_view str, const HloParserOptions& options) {
+    absl::string_view str, const HloParserOptions& options,
+    std::optional<int> module_id) {
   return std::make_unique<HloParserImpl>(str, options);
 }
 
