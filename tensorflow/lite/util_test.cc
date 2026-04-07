@@ -19,6 +19,7 @@ limitations under the License.
 #include <stdlib.h>
 
 #include <algorithm>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -141,6 +142,30 @@ TEST(MultiplyAndCheckOverflow, Validate) {
   EXPECT_TRUE(MultiplyAndCheckOverflow(1, 2, &res) == kTfLiteOk);
   EXPECT_FALSE(MultiplyAndCheckOverflow(static_cast<size_t>(123456789023),
                                         1223423425, &res) == kTfLiteOk);
+}
+
+TEST(CheckedNumElements, Validate) {
+  std::vector<int> dims = {2, 3, 4};
+  size_t count = 0;
+
+  EXPECT_EQ(CheckedNumElements(dims, &count), kTfLiteOk);
+  EXPECT_EQ(count, 24);
+}
+
+TEST(CheckedNumElements, RejectsNegativeDimension) {
+  std::vector<int> dims = {2, -1, 4};
+  size_t count = 0;
+
+  EXPECT_EQ(CheckedNumElements(dims, &count), kTfLiteError);
+}
+
+TEST(CheckedNumElements, RejectsOverflow) {
+  std::vector<int> dims = {std::numeric_limits<int>::max(),
+                           std::numeric_limits<int>::max(),
+                           std::numeric_limits<int>::max()};
+  size_t count = 0;
+
+  EXPECT_EQ(CheckedNumElements(dims, &count), kTfLiteError);
 }
 
 TEST(FourBitTest, BytesRequiredEven) {

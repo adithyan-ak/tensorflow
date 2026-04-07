@@ -16,8 +16,11 @@ limitations under the License.
 #include <stddef.h>
 #include <stdint.h>
 
+#include <initializer_list>
+#include <limits>
 #include <vector>
 
+#include "absl/types/span.h"
 #include "tensorflow/lite/core/c/builtin_op_data.h"
 #include "tensorflow/lite/core/c/common.h"
 #include "tensorflow/lite/kernels/cpu_backend_context.h"
@@ -35,6 +38,7 @@ limitations under the License.
 #include "tensorflow/lite/kernels/internal/types.h"
 #include "tensorflow/lite/kernels/kernel_util.h"
 #include "tensorflow/lite/kernels/padding.h"
+#include "tensorflow/lite/util.h"
 
 namespace tflite {
 namespace ops {
@@ -111,6 +115,42 @@ void* Init(TfLiteContext* context, const char* buffer, size_t length) {
 void Free(TfLiteContext* context, void* buffer) {
   delete reinterpret_cast<OpData*>(buffer);
 }
+
+namespace {
+
+TfLiteStatus CheckedShapeProductToInt(TfLiteContext* context,
+                                      std::initializer_list<int> dims,
+                                      const char* error_message, int* product) {
+  size_t checked_product = 0;
+  const absl::Span<const int> dims_span(dims.begin(), dims.size());
+  TF_LITE_ENSURE_MSG(
+      context, CheckedNumElements(dims_span, &checked_product) == kTfLiteOk,
+      "%s", error_message);
+  TF_LITE_ENSURE_MSG(
+      context,
+      checked_product <= static_cast<size_t>(std::numeric_limits<int>::max()),
+      "%s", error_message);
+  *product = static_cast<int>(checked_product);
+  return kTfLiteOk;
+}
+
+TfLiteStatus CheckedTensorNumElementsToInt(TfLiteContext* context,
+                                           const TfLiteTensor* tensor,
+                                           const char* error_message,
+                                           int* product) {
+  size_t checked_product = 0;
+  TF_LITE_ENSURE_MSG(context,
+                     CheckedNumElements(tensor, &checked_product) == kTfLiteOk,
+                     "%s", error_message);
+  TF_LITE_ENSURE_MSG(
+      context,
+      checked_product <= static_cast<size_t>(std::numeric_limits<int>::max()),
+      "%s", error_message);
+  *product = static_cast<int>(checked_product);
+  return kTfLiteOk;
+}
+
+}  // namespace
 
 TfLiteStatus ResizeTensor(TfLiteContext* context,
                           const TfLiteTensor* shape_tensor,
@@ -216,9 +256,18 @@ TfLiteStatus ResizeCol2ImTensor(TfLiteContext* context,
   TfLiteIntArray* col2im_shape_array = TfLiteIntArrayCreate(2);
   const RuntimeShape& input_shape = GetTensorShape(input);
   const RuntimeShape& weights_shape = GetTensorShape(weights);
-  col2im_shape_array->data[0] = input_shape.Dims(1) * input_shape.Dims(2);
-  col2im_shape_array->data[1] =
-      weights_shape.Dims(0) * weights_shape.Dims(1) * weights_shape.Dims(2);
+  TF_LITE_ENSURE_OK(context,
+                    CheckedShapeProductToInt(
+                        context, {input_shape.Dims(1), input_shape.Dims(2)},
+                        "TransposeConv col2im tensor has too many rows.",
+                        &col2im_shape_array->data[0]));
+  TF_LITE_ENSURE_OK(
+      context,
+      CheckedShapeProductToInt(
+          context,
+          {weights_shape.Dims(0), weights_shape.Dims(1), weights_shape.Dims(2)},
+          "TransposeConv col2im tensor has too many columns.",
+          &col2im_shape_array->data[1]));
 
   col2im->type = input->type == kTfLiteFloat32 ? kTfLiteFloat32 : kTfLiteInt32;
   col2im->allocation_type = kTfLiteDynamic;
@@ -468,7 +517,13 @@ TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) {
     // flattened to 2D.
     const int channels_in = weights->dims->data[3];
     TF_LITE_ENSURE(context, channels_in != 0);
-    const int height = NumElements(input) / channels_in;
+    int input_num_elements = 0;
+    TF_LITE_ENSURE_OK(
+        context,
+        CheckedTensorNumElementsToInt(
+            context, input, "TransposeConv hybrid input has too many elements.",
+            &input_num_elements));
+    const int height = input_num_elements / channels_in;
     int scaling_dims[1] = {height};
     if (!TfLiteIntArrayEqualsArray(scaling_factors->dims, 1, scaling_dims)) {
       TfLiteIntArray* scaling_factors_size = TfLiteIntArrayCreate(1);

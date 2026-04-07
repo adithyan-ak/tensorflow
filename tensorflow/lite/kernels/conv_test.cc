@@ -140,6 +140,81 @@ class ConvolutionOpModel : public BaseConvolutionOpModel<float> {
   std::vector<float> GetOutput() { return ExtractVector<float>(output_); }
 };
 
+template <typename FilterType>
+class PrepareOnlyConvolutionOpModel : public SingleOpModel {
+ public:
+  PrepareOnlyConvolutionOpModel(
+      TfLiteRegistration* registration, const TensorData& input,
+      const TensorData& filter, const TensorData& output, int stride_width = 2,
+      int stride_height = 2, enum Padding padding = Padding_VALID,
+      enum ActivationFunctionType activation = ActivationFunctionType_NONE,
+      int dilation_width_factor = 1, int dilation_height_factor = 1,
+      int num_threads = -1, bool const_filter = false,
+      const TensorType bias_type = TensorType_INT32) {
+    input_ = AddInput(input);
+    if (const_filter) {
+      filter_ = AddConstInput(
+          filter, std::vector<FilterType>{static_cast<FilterType>(0)});
+    } else {
+      filter_ = AddInput(filter);
+    }
+
+    const int bias_size = GetShape(filter_)[0];
+    if (input.type == TensorType_FLOAT32) {
+      bias_ = AddInput({TensorType_FLOAT32, {bias_size}});
+    } else {
+      if (filter.per_channel_quantization) {
+        std::vector<float> bias_scale(
+            filter.per_channel_quantization_scales.size());
+        std::vector<int64_t> bias_zero_points(
+            filter.per_channel_quantization_scales.size());
+        for (size_t i = 0; i < filter.per_channel_quantization_scales.size();
+             ++i) {
+          bias_scale[i] =
+              input.scale * filter.per_channel_quantization_scales[i];
+          bias_zero_points[i] = 0;
+        }
+        TensorData bias{bias_type,
+                        {bias_size},
+                        /*min=*/0,
+                        /*max=*/0,
+                        /*scale=*/0,
+                        /*zero_point=*/0,
+                        true,
+                        /*per_channel_quantization_scales=*/bias_scale,
+                        /*per_channel_quantization_offsets=*/bias_zero_points,
+                        /*channel_index==*/0};
+        bias_ = AddInput(bias);
+      } else {
+        const auto bias_scale = GetScale(input_) * GetScale(filter_);
+        TensorData bias{bias_type, {bias_size}, 0, 0, bias_scale};
+        bias_ = AddInput(bias);
+      }
+    }
+
+    output_ = AddOutput(output);
+
+    SetBuiltinOp(BuiltinOperator_CONV_2D, BuiltinOptions_Conv2DOptions,
+                 CreateConv2DOptions(
+                     builder_, padding, stride_width, stride_height, activation,
+                     dilation_width_factor, dilation_height_factor, bias_type)
+                     .Union());
+
+    resolver_ = std::make_unique<SingleOpResolver>(BuiltinOperator_CONV_2D,
+                                                   registration);
+    BuildInterpreter({GetShape(input_), GetShape(filter_), GetShape(bias_)},
+                     num_threads, /*allow_fp32_relax_to_fp16=*/false,
+                     /*apply_delegate=*/false,
+                     /*allocate_and_delegate=*/false);
+  }
+
+ private:
+  int input_;
+  int filter_;
+  int bias_;
+  int output_;
+};
+
 const auto kKernelMap = new std::map<string, TfLiteRegistration*>({
     {"Reference", ops::builtin::Register_CONVOLUTION_REF()},
     {"GenericOptimized", ops::builtin::Register_CONVOLUTION_GENERIC_OPT()},
@@ -157,6 +232,78 @@ class ConvolutionOpTest : public SingleOpTest {
   }
 };
 
+TEST(ConvolutionPrepareSecurityTest, RejectsIm2ColSizeOverflow) {
+  constexpr int kHugeDim = 1 << 15;
+  PrepareOnlyConvolutionOpModel<float> m(
+      ops::builtin::Register_CONVOLUTION_GENERIC_OPT(),
+      {TensorType_FLOAT32, {kHugeDim, kHugeDim, kHugeDim, kHugeDim}},
+      {TensorType_FLOAT32, {1, 1, 17, kHugeDim}}, {TensorType_FLOAT32, {}},
+      /*stride_width=*/1, /*stride_height=*/1, Padding_VALID,
+      ActivationFunctionType_NONE, /*dilation_width_factor=*/1,
+      /*dilation_height_factor=*/1, /*num_threads=*/1);
+
+  EXPECT_EQ(m.AllocateTensors(), kTfLiteError);
+}
+
+TEST(ConvolutionPrepareSecurityTest, RejectsHwcnWeightsSizeOverflow) {
+  constexpr int kHugeDim = 46341;
+  PrepareOnlyConvolutionOpModel<float> m(
+      ops::builtin::Register_CONVOLUTION_MULTITHREADED_OPT(),
+      {TensorType_FLOAT32, {1, kHugeDim, kHugeDim, 1}},
+      {TensorType_FLOAT32, {1, kHugeDim, kHugeDim, 1}},
+      {TensorType_FLOAT32, {}},
+      /*stride_width=*/1, /*stride_height=*/1, Padding_VALID,
+      ActivationFunctionType_NONE, /*dilation_width_factor=*/1,
+      /*dilation_height_factor=*/1, /*num_threads=*/2);
+  m.GetInputTensor(1)->allocation_type = kTfLitePersistentRo;
+
+  EXPECT_EQ(m.AllocateTensors(), kTfLiteError);
+}
+
+TEST(ConvolutionPrepareSecurityTest, RejectsHybridScratchOverflow) {
+  constexpr int kOverflowDim = 46341;
+  PrepareOnlyConvolutionOpModel<int8_t> m(
+      ops::builtin::Register_CONVOLUTION_GENERIC_OPT(),
+      {TensorType_FLOAT32, {kOverflowDim, 2, kOverflowDim, 1}},
+      {TensorType_INT8, {1, 1, 1, 1}, -1.0f, 1.0f}, {TensorType_FLOAT32, {}},
+      /*stride_width=*/1, /*stride_height=*/1, Padding_VALID,
+      ActivationFunctionType_NONE, /*dilation_width_factor=*/1,
+      /*dilation_height_factor=*/1, /*num_threads=*/1,
+      /*const_filter=*/false);
+
+  EXPECT_EQ(m.AllocateTensors(), kTfLiteError);
+}
+
+TEST(ConvolutionPrepareSecurityTest, RejectsHybridInputSizeOverflow) {
+  constexpr int kHugeDim = 46341;
+  PrepareOnlyConvolutionOpModel<int8_t> m(
+      ops::builtin::Register_CONVOLUTION_GENERIC_OPT(),
+      {TensorType_FLOAT32, {1, kHugeDim, 1, kHugeDim}},
+      {TensorType_INT8, {1, 1, 1, kHugeDim}, -1.0f, 1.0f},
+      {TensorType_FLOAT32, {}},
+      /*stride_width=*/1, /*stride_height=*/1, Padding_VALID,
+      ActivationFunctionType_NONE, /*dilation_width_factor=*/1,
+      /*dilation_height_factor=*/1, /*num_threads=*/1,
+      /*const_filter=*/false);
+
+  EXPECT_EQ(m.AllocateTensors(), kTfLiteError);
+}
+
+TEST(ConvolutionPrepareSecurityTest, RejectsInt4FilterSizeOverflow) {
+  constexpr int kHugeDim = 46341;
+  PrepareOnlyConvolutionOpModel<int8_t> m(
+      ops::builtin::Register_CONVOLUTION_GENERIC_OPT(),
+      {TensorType_FLOAT32, {1, 1, 1, kHugeDim}},
+      {TensorType_INT4, {kHugeDim, 1, 1, kHugeDim}, 0.0f, 0.0f, 1.0f, 0},
+      {TensorType_FLOAT32, {}},
+      /*stride_width=*/1, /*stride_height=*/1, Padding_VALID,
+      ActivationFunctionType_NONE, /*dilation_width_factor=*/1,
+      /*dilation_height_factor=*/1, /*num_threads=*/1,
+      /*const_filter=*/false);
+
+  EXPECT_EQ(m.AllocateTensors(), kTfLiteError);
+}
+
 TEST_P(ConvolutionOpTest, SimpleTestFloat32) {
   ConvolutionOpModel m(GetRegistration(), {TensorType_FLOAT32, {2, 2, 4, 1}},
                        {TensorType_FLOAT32, {3, 2, 2, 1}},
@@ -164,26 +311,55 @@ TEST_P(ConvolutionOpTest, SimpleTestFloat32) {
 
   m.SetInput({
       // First batch
-      1, 1, 1, 1,  // row = 1
-      2, 2, 2, 2,  // row = 2
+      1,
+      1,
+      1,
+      1,  // row = 1
+      2,
+      2,
+      2,
+      2,  // row = 2
       // Second batch
-      1, 2, 3, 4,  // row = 1
-      1, 2, 3, 4,  // row = 2
+      1,
+      2,
+      3,
+      4,  // row = 1
+      1,
+      2,
+      3,
+      4,  // row = 2
   });
   m.SetFilter({
-      1, 2, 3, 4,    // first 2x2 filter
-      -1, 1, -1, 1,  // second 2x2 filter
-      -1, -1, 1, 1,  // third 2x2 filter
+      1,
+      2,
+      3,
+      4,  // first 2x2 filter
+      -1,
+      1,
+      -1,
+      1,  // second 2x2 filter
+      -1,
+      -1,
+      1,
+      1,  // third 2x2 filter
   });
   m.SetBias({1, 2, 3});
 
   ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({
-                                 18, 2, 5,  // first batch, left
-                                 18, 2, 5,  // first batch, right
-                                 17, 4, 3,  // second batch, left
-                                 37, 4, 3,  // second batch, right
+                                 18,
+                                 2,
+                                 5,  // first batch, left
+                                 18,
+                                 2,
+                                 5,  // first batch, right
+                                 17,
+                                 4,
+                                 3,  // second batch, left
+                                 37,
+                                 4,
+                                 3,  // second batch, right
                              }));
 }
 
@@ -195,26 +371,55 @@ TEST_P(ConvolutionOpTest, SimpleTestFloat32SingleThreaded) {
 
   m.SetInput({
       // First batch
-      1, 1, 1, 1,  // row = 1
-      2, 2, 2, 2,  // row = 2
+      1,
+      1,
+      1,
+      1,  // row = 1
+      2,
+      2,
+      2,
+      2,  // row = 2
       // Second batch
-      1, 2, 3, 4,  // row = 1
-      1, 2, 3, 4,  // row = 2
+      1,
+      2,
+      3,
+      4,  // row = 1
+      1,
+      2,
+      3,
+      4,  // row = 2
   });
   m.SetFilter({
-      1, 2, 3, 4,    // first 2x2 filter
-      -1, 1, -1, 1,  // second 2x2 filter
-      -1, -1, 1, 1,  // third 2x2 filter
+      1,
+      2,
+      3,
+      4,  // first 2x2 filter
+      -1,
+      1,
+      -1,
+      1,  // second 2x2 filter
+      -1,
+      -1,
+      1,
+      1,  // third 2x2 filter
   });
   m.SetBias({1, 2, 3});
 
   ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({
-                                 18, 2, 5,  // first batch, left
-                                 18, 2, 5,  // first batch, right
-                                 17, 4, 3,  // second batch, left
-                                 37, 4, 3,  // second batch, right
+                                 18,
+                                 2,
+                                 5,  // first batch, left
+                                 18,
+                                 2,
+                                 5,  // first batch, right
+                                 17,
+                                 4,
+                                 3,  // second batch, left
+                                 37,
+                                 4,
+                                 3,  // second batch, right
                              }));
 }
 
@@ -246,10 +451,18 @@ TEST_P(ConvolutionOpTest, SimpleTestFloat32WithChannels) {
   ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({
-                                 18, 2, 5,  // first batch, left
-                                 18, 2, 5,  // first batch, right
-                                 17, 4, 3,  // second batch, left
-                                 37, 4, 3,  // second batch, right
+                                 18,
+                                 2,
+                                 5,  // first batch, left
+                                 18,
+                                 2,
+                                 5,  // first batch, right
+                                 17,
+                                 4,
+                                 3,  // second batch, left
+                                 37,
+                                 4,
+                                 3,  // second batch, right
                              }));
 }
 
@@ -267,16 +480,24 @@ TEST_P(ConvolutionOpTest, SimpleTestFloat32WithChannelsGrouped) {
       4, 4, 4, 4   // row = 2
   });
   m.SetFilter({
-      1, 1, 1, 1,      // first 2x2 filter
-      -1, -1, -1, -1,  // second 2x2 filter
+      1,
+      1,
+      1,
+      1,  // first 2x2 filter
+      -1,
+      -1,
+      -1,
+      -1,  // second 2x2 filter
   });
   m.SetBias({1, 2});
 
   ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({
-                                 7, -4,    // first batch
-                                 15, -12,  // second batch
+                                 7,
+                                 -4,  // first batch
+                                 15,
+                                 -12,  // second batch
                              }));
 }
 
@@ -287,15 +508,33 @@ TEST_P(ConvolutionOpTest, InputAndFilterSameWidthHeight) {
 
   m.SetInput({
       // First batch
-      1, 1, 1, 1,  // row = 1
-      2, 2, 2, 2,  // row = 2
+      1,
+      1,
+      1,
+      1,  // row = 1
+      2,
+      2,
+      2,
+      2,  // row = 2
       // Second batch
-      1, 2, 3, 4,  // row = 1
-      1, 2, 3, 4,  // row = 2
+      1,
+      2,
+      3,
+      4,  // row = 1
+      1,
+      2,
+      3,
+      4,  // row = 2
   });
   m.SetFilter({
-      1, 2, 3, 4,    // row = 1
-      -1, -1, 1, 1,  // row = 2
+      1,
+      2,
+      3,
+      4,  // row = 1
+      -1,
+      -1,
+      1,
+      1,  // row = 2
   });
   m.SetBias({0});
 
@@ -315,26 +554,55 @@ TEST_P(ConvolutionOpTest, ActivationReluN1Test) {
 
   m.SetInput({
       // First batch
-      1, 1, 1, 1,  // row = 1
-      2, 2, 2, 2,  // row = 2
+      1,
+      1,
+      1,
+      1,  // row = 1
+      2,
+      2,
+      2,
+      2,  // row = 2
       // Second batch
-      1, 2, 3, 4,  // row = 1
-      1, 2, 3, 4,  // row = 2
+      1,
+      2,
+      3,
+      4,  // row = 1
+      1,
+      2,
+      3,
+      4,  // row = 2
   });
   m.SetFilter({
-      1, 2, 3, 4,    // first 2x2 filter
-      -1, 1, -1, 1,  // second 2x2 filter
-      -1, -1, 1, 1,  // third 2x2 filter
+      1,
+      2,
+      3,
+      4,  // first 2x2 filter
+      -1,
+      1,
+      -1,
+      1,  // second 2x2 filter
+      -1,
+      -1,
+      1,
+      1,  // third 2x2 filter
   });
   m.SetBias({1, 2, 3});
 
   ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({
-                                 1, 1, 1,  // first batch, left
-                                 1, 1, 1,  // first batch, right
-                                 1, 1, 1,  // second batch, left
-                                 1, 1, 1,  // second batch, right
+                                 1,
+                                 1,
+                                 1,  // first batch, left
+                                 1,
+                                 1,
+                                 1,  // first batch, right
+                                 1,
+                                 1,
+                                 1,  // second batch, left
+                                 1,
+                                 1,
+                                 1,  // second batch, right
                              }));
 }
 
@@ -349,26 +617,55 @@ TEST_P(ConvolutionOpTest, ActivationRelu6Test) {
 
   m.SetInput({
       // First batch
-      1, 1, 1, 1,  // row = 1
-      2, 2, 2, 2,  // row = 2
+      1,
+      1,
+      1,
+      1,  // row = 1
+      2,
+      2,
+      2,
+      2,  // row = 2
       // Second batch
-      1, 2, 3, 4,  // row = 1
-      1, 2, 3, 4,  // row = 2
+      1,
+      2,
+      3,
+      4,  // row = 1
+      1,
+      2,
+      3,
+      4,  // row = 2
   });
   m.SetFilter({
-      1, 2, 3, 4,    // first 2x2 filter
-      -1, 1, -1, 1,  // second 2x2 filter
-      -1, -1, 1, 1,  // third 2x2 filter
+      1,
+      2,
+      3,
+      4,  // first 2x2 filter
+      -1,
+      1,
+      -1,
+      1,  // second 2x2 filter
+      -1,
+      -1,
+      1,
+      1,  // third 2x2 filter
   });
   m.SetBias({1, 2, 3});
 
   ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({
-                                 6, 2, 5,  // first batch, left
-                                 6, 2, 5,  // first batch, right
-                                 6, 4, 3,  // second batch, left
-                                 6, 4, 3,  // second batch, right
+                                 6,
+                                 2,
+                                 5,  // first batch, left
+                                 6,
+                                 2,
+                                 5,  // first batch, right
+                                 6,
+                                 4,
+                                 3,  // second batch, left
+                                 6,
+                                 4,
+                                 3,  // second batch, right
                              }));
 }
 
@@ -383,28 +680,61 @@ TEST_P(ConvolutionOpTest, StrideTest) {
 
   m.SetInput({
       // First batch
-      1, 1, 1, 1,  // row = 1
-      2, 2, 3, 2,  // row = 2
+      1,
+      1,
+      1,
+      1,  // row = 1
+      2,
+      2,
+      3,
+      2,  // row = 2
       // Second batch
-      1, 2, 3, 4,  // row = 1
-      1, 2, 4, 4,  // row = 2
+      1,
+      2,
+      3,
+      4,  // row = 1
+      1,
+      2,
+      4,
+      4,  // row = 2
   });
   m.SetFilter({
-      1, 2, 3, 4,    // first 2x2 filter
-      -1, 1, -1, 1,  // second 2x2 filter
-      -1, -1, 1, 1,  // third 2x2 filter
+      1,
+      2,
+      3,
+      4,  // first 2x2 filter
+      -1,
+      1,
+      -1,
+      1,  // second 2x2 filter
+      -1,
+      -1,
+      1,
+      1,  // third 2x2 filter
   });
   m.SetBias({1, 2, 3});
 
   ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({
-                                 18, 2, 5,  // first batch, left
-                                 22, 3, 6,  // first batch, middle
-                                 21, 1, 6,  // first batch, right
-                                 17, 4, 3,  // second batch, left
-                                 31, 5, 4,  // second batch, middle
-                                 40, 3, 4,  // second batch, right
+                                 18,
+                                 2,
+                                 5,  // first batch, left
+                                 22,
+                                 3,
+                                 6,  // first batch, middle
+                                 21,
+                                 1,
+                                 6,  // first batch, right
+                                 17,
+                                 4,
+                                 3,  // second batch, left
+                                 31,
+                                 5,
+                                 4,  // second batch, middle
+                                 40,
+                                 3,
+                                 4,  // second batch, right
                              }));
 }
 
@@ -418,13 +748,28 @@ TEST_P(ConvolutionOpTest, PaddingTest) {
                        /*ActivationFunctionType=*/ActivationFunctionType_NONE);
 
   m.SetInput({
-      1, 1, 1, 1,  // row = 1
-      2, 2, 3, 2,  // row = 2
+      1,
+      1,
+      1,
+      1,  // row = 1
+      2,
+      2,
+      3,
+      2,  // row = 2
   });
   m.SetFilter({
-      1, 2, 3, 4,    // first 2x2 filter
-      -1, 1, -1, 1,  // second 2x2 filter
-      -1, -1, 1, 1,  // third 2x2 filter
+      1,
+      2,
+      3,
+      4,  // first 2x2 filter
+      -1,
+      1,
+      -1,
+      1,  // second 2x2 filter
+      -1,
+      -1,
+      1,
+      1,  // third 2x2 filter
   });
   m.SetBias({1, 2, 3});
 
@@ -457,22 +802,34 @@ TEST_P(ConvolutionOpTest, PointwiseFloat32) {
   });
 
   m.SetFilter({
-      1, 2,  // first filter
+      1,
+      2,  // first filter
   });
   m.SetBias({0});
 
   ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
-  EXPECT_THAT(m.GetOutput(),
-              Pointwise(FloatingPointEq(), {
-                                               // First batch
-                                               1.5, 1.5, 1.5, 1.5,  // row = 1
-                                               3., 3., 3., 3.,      // row = 2
+  EXPECT_THAT(m.GetOutput(), Pointwise(FloatingPointEq(), {
+                                                              // First batch
+                                                              1.5,
+                                                              1.5,
+                                                              1.5,
+                                                              1.5,  // row = 1
+                                                              3.,
+                                                              3.,
+                                                              3.,
+                                                              3.,  // row = 2
 
-                                               // Second batch
-                                               1.5, 3., 4.5, 6.,  // row = 1
-                                               1.5, 3., 4.5, 6.,  // row = 2
-                                           }));
+                                                              // Second batch
+                                                              1.5,
+                                                              3.,
+                                                              4.5,
+                                                              6.,  // row = 1
+                                                              1.5,
+                                                              3.,
+                                                              4.5,
+                                                              6.,  // row = 2
+                                                          }));
 }
 
 // TODO(alanchiao): this passes locally, but fails on continuous build system.
@@ -492,8 +849,10 @@ TEST_P(ConvolutionOpTest, DISABLED_PointwiseMultifilterFloat32) {
   });
 
   m.SetFilter({
-      1, 2,  // first filter
-      2, 3,  // second filter
+      1,
+      2,  // first filter
+      2,
+      3,  // second filter
   });
   m.SetBias({0});
 
@@ -515,19 +874,38 @@ TEST_P(ConvolutionOpTest, SimpleTestFloat32WithAnisotropicStrides) {
                        {TensorType_FLOAT32, {}},
                        /*stride_width=*/3, /*stride_height=*/1);
   m.SetInput({
-      3, 2, 1, -1, -2, -3,  //
-      4, 3, 2, -2, -3, -4,  //
-      5, 4, 3, -3, -4, -5,  //
+      3,
+      2,
+      1,
+      -1,
+      -2,
+      -3,  //
+      4,
+      3,
+      2,
+      -2,
+      -3,
+      -4,  //
+      5,
+      4,
+      3,
+      -3,
+      -4,
+      -5,  //
   });
   m.SetFilter({
-      1, 2,  //
-      3, 4,  //
+      1,
+      2,  //
+      3,
+      4,  //
   });
   m.SetBias({-1});
   ASSERT_EQ(m.Invoke(), kTfLiteOk);
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({
-                                 30, -24,  //
-                                 40, -34,  //
+                                 30,
+                                 -24,  //
+                                 40,
+                                 -34,  //
                              }));
 }
 
@@ -919,36 +1297,72 @@ TEST_P(ConvolutionOpTest, SimpleTestQuantized) {
                                 {TensorType_UINT8, {}, -127, 128});
   m.SetInput({
       // First batch
-      1, 1, 1, 1,  // row = 1
-      2, 2, 2, 2,  // row = 2
+      1,
+      1,
+      1,
+      1,  // row = 1
+      2,
+      2,
+      2,
+      2,  // row = 2
       // Second batch
-      1, 2, 3, 4,  // row = 1
-      1, 2, 3, 4,  // row = 2
+      1,
+      2,
+      3,
+      4,  // row = 1
+      1,
+      2,
+      3,
+      4,  // row = 2
   });
   m.SetFilter({
-      1, 2, 3, 4,    // first 2x2 filter
-      -1, 1, -1, 1,  // second 2x2 filter
-      -1, -1, 1, 1,  // third 2x2 filter
+      1,
+      2,
+      3,
+      4,  // first 2x2 filter
+      -1,
+      1,
+      -1,
+      1,  // second 2x2 filter
+      -1,
+      -1,
+      1,
+      1,  // third 2x2 filter
   });
   m.SetBias({1, 2, 3});
 
   ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
-  EXPECT_THAT(m.GetDequantizedOutput(),
-              ElementsAreArray(ArrayFloatNear(
-                  {
-                      18, 2, 5,  // first batch, left
-                      18, 2, 5,  // first batch, right
-                      17, 4, 3,  // second batch, left
-                      37, 4, 3,  // second batch, right
-                  },
-                  1e-5)));
+  EXPECT_THAT(m.GetDequantizedOutput(), ElementsAreArray(ArrayFloatNear(
+                                            {
+                                                18,
+                                                2,
+                                                5,  // first batch, left
+                                                18,
+                                                2,
+                                                5,  // first batch, right
+                                                17,
+                                                4,
+                                                3,  // second batch, left
+                                                37,
+                                                4,
+                                                3,  // second batch, right
+                                            },
+                                            1e-5)));
   // For good  measure, let's also verify the quantized values:
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({
-                                 145, 129, 132,  //
-                                 145, 129, 132,  //
-                                 144, 131, 130,  //
-                                 164, 131, 130,  //
+                                 145,
+                                 129,
+                                 132,  //
+                                 145,
+                                 129,
+                                 132,  //
+                                 144,
+                                 131,
+                                 130,  //
+                                 164,
+                                 131,
+                                 130,  //
                              }));
 }
 
@@ -959,15 +1373,33 @@ TEST_P(ConvolutionOpTest, SimpleTestQuantizedGrouped) {
                                 {TensorType_UINT8, {}, -127, 128});
   m.SetInput({
       // First batch
-      1, 1, 1, 1,  // row = 1
-      2, 2, 2, 2,  // row = 2
+      1,
+      1,
+      1,
+      1,  // row = 1
+      2,
+      2,
+      2,
+      2,  // row = 2
       // Second batch
-      1, 2, 3, 4,  // row = 1
-      1, 2, 3, 4,  // row = 2
+      1,
+      2,
+      3,
+      4,  // row = 1
+      1,
+      2,
+      3,
+      4,  // row = 2
   });
   m.SetFilter({
-      1, 2, 3, 4,    // first 2x2 filter
-      -1, 1, -1, 1,  // second 2x2 filter
+      1,
+      2,
+      3,
+      4,  // first 2x2 filter
+      -1,
+      1,
+      -1,
+      1,  // second 2x2 filter
   });
   m.SetBias({1, 2});
 
@@ -981,8 +1413,10 @@ TEST_P(ConvolutionOpTest, SimpleTestQuantizedGrouped) {
                                             1e-5)));
   // For good  measure, let's also verify the quantized values:
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({
-                                 145, 129,  //
-                                 150, 133,  //
+                                 145,
+                                 129,  //
+                                 150,
+                                 133,  //
                              }));
 }
 
@@ -1022,11 +1456,23 @@ TEST_P(ConvolutionOpTest, SimpleTestQuantizedOutputMultiplierGreaterThan1) {
       {TensorType_FLOAT32, {3, 2, 2, 1}}, {TensorType_FLOAT32, {}});
   std::initializer_list<float> input = {
       // First batch
-      1, 1, 1, 1,  // row = 1
-      2, 2, 2, 2,  // row = 2
+      1,
+      1,
+      1,
+      1,  // row = 1
+      2,
+      2,
+      2,
+      2,  // row = 2
       // Second batch
-      1, 2, 3, 4,  // row = 1
-      1, 2, 3, 4,  // row = 2
+      1,
+      2,
+      3,
+      4,  // row = 1
+      1,
+      2,
+      3,
+      4,  // row = 2
   };
   std::initializer_list<float> filter = {
       1,  2,  3,  4,  // first 2x2 filter
@@ -1056,23 +1502,44 @@ TEST_P(ConvolutionOpTest, SimpleTestQuantizedWithAnisotropicStrides) {
                                 {TensorType_UINT8, {}, -127, 128},
                                 /*stride_width=*/3, /*stride_height=*/1);
   m.SetInput({
-      3, 2, 1, -1, -2, -3,  //
-      4, 3, 2, -2, -3, -4,  //
-      5, 4, 3, -3, -4, -5,  //
+      3,
+      2,
+      1,
+      -1,
+      -2,
+      -3,  //
+      4,
+      3,
+      2,
+      -2,
+      -3,
+      -4,  //
+      5,
+      4,
+      3,
+      -3,
+      -4,
+      -5,  //
   });
   m.SetFilter({
-      1, 2,  //
-      3, 4,  //
+      1,
+      2,  //
+      3,
+      4,  //
   });
   m.SetBias({-1});
   ASSERT_EQ(m.Invoke(), kTfLiteOk);
   EXPECT_THAT(m.GetDequantizedOutput(), ElementsAreArray(ArrayFloatNear({
-                                            30, -24,  //
-                                            40, -34,  //
+                                            30,
+                                            -24,  //
+                                            40,
+                                            -34,  //
                                         })));
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({
-                                 157, 103,  //
-                                 167, 93,   //
+                                 157,
+                                 103,  //
+                                 167,
+                                 93,  //
                              }));
 }
 
@@ -1172,16 +1639,37 @@ TEST_P(ConvolutionOpTest, SimpleTestHybridUint8) {
 
   m.SetInput({
       // First batch
-      1, 1, 1, 1,  // row = 1
-      2, 2, 2, 2,  // row = 2
+      1,
+      1,
+      1,
+      1,  // row = 1
+      2,
+      2,
+      2,
+      2,  // row = 2
       // Second batch
-      1, 2, 3, 4,  // row = 1
-      1, 2, 3, 4,  // row = 2
+      1,
+      2,
+      3,
+      4,  // row = 1
+      1,
+      2,
+      3,
+      4,  // row = 2
   });
   m.SetFilter({
-      1, 2, 3, 4,    // first 2x2 filter
-      -1, 1, -1, 1,  // second 2x2 filter
-      -1, -1, 1, 1,  // third 2x2 filter
+      1,
+      2,
+      3,
+      4,  // first 2x2 filter
+      -1,
+      1,
+      -1,
+      1,  // second 2x2 filter
+      -1,
+      -1,
+      1,
+      1,  // third 2x2 filter
   });
   m.SetBias({1, 2, 3});
 
@@ -1211,10 +1699,18 @@ TEST_P(ConvolutionOpTest, SimpleTestHybridUint8) {
   // and multiplies it with the filter directly.
   EXPECT_THAT(m.GetOutput(), ElementsAreArray(ArrayFloatNear(
                                  {
-                                     18, 2, 5,  // first batch, left
-                                     18, 2, 5,  // first batch, right
-                                     17, 4, 3,  // second batch, left
-                                     37, 4, 3,  // second batch, right
+                                     18,
+                                     2,
+                                     5,  // first batch, left
+                                     18,
+                                     2,
+                                     5,  // first batch, right
+                                     17,
+                                     4,
+                                     3,  // second batch, left
+                                     37,
+                                     4,
+                                     3,  // second batch, right
                                  },
                                  0.16)));
 }
@@ -1282,10 +1778,18 @@ TEST_P(ConvolutionOpTest, SimpleTestHybridWithChannelsUint8) {
 
   EXPECT_THAT(m.GetOutput(), ElementsAreArray(ArrayFloatNear(
                                  {
-                                     18, 2, 5,  // first batch, left
-                                     18, 2, 5,  // first batch, right
-                                     17, 4, 3,  // second batch, left
-                                     37, 4, 3,  // second batch, right
+                                     18,
+                                     2,
+                                     5,  // first batch, left
+                                     18,
+                                     2,
+                                     5,  // first batch, right
+                                     17,
+                                     4,
+                                     3,  // second batch, left
+                                     37,
+                                     4,
+                                     3,  // second batch, right
                                  },
                                  0.16)));
 }
@@ -1316,10 +1820,22 @@ TEST_P(ConvolutionOpTest, SimpleTestHybridWithChannelsUint8Grouped) {
 
   EXPECT_THAT(m.GetOutput(), ElementsAreArray(ArrayFloatNear(
                                  {
-                                     18, 2, 5, 2,  // first batch, left
-                                     18, 2, 5, 2,  // first batch, right
-                                     17, 4, 3, 4,  // second batch, left
-                                     37, 4, 3, 4,  // second batch, right
+                                     18,
+                                     2,
+                                     5,
+                                     2,  // first batch, left
+                                     18,
+                                     2,
+                                     5,
+                                     2,  // first batch, right
+                                     17,
+                                     4,
+                                     3,
+                                     4,  // second batch, left
+                                     37,
+                                     4,
+                                     3,
+                                     4,  // second batch, right
                                  },
                                  0.16)));
 }
@@ -1340,7 +1856,8 @@ TEST_P(ConvolutionOpTest, PointwiseHybridUint8) {
   });
 
   m.SetFilter({
-      1, 2,  // first filter
+      1,
+      2,  // first filter
   });
   m.SetBias({0});
 
@@ -1356,15 +1873,26 @@ TEST_P(ConvolutionOpTest, PointwiseHybridUint8) {
   // 64 127 with scale factor of 127/2.
   //
   // (64 * 64 + 64 * 127) * (2/127)^2 gives us the expected result.
-  EXPECT_THAT(m.GetOutput(),
-              ElementsAreArray(ArrayFloatNear(
-                  {
-                      1.5, 1.5, 1.5, 1.5,  // first batch, row = 1
-                      3., 3., 3., 3.,      // first batch, row = 2
-                      1.5, 3., 4.5, 6.,    // second batch, row = 1
-                      1.5, 3., 4.5, 6.,    // second batch, row = 2
-                  },
-                  0.0316)));
+  EXPECT_THAT(m.GetOutput(), ElementsAreArray(ArrayFloatNear(
+                                 {
+                                     1.5,
+                                     1.5,
+                                     1.5,
+                                     1.5,  // first batch, row = 1
+                                     3.,
+                                     3.,
+                                     3.,
+                                     3.,  // first batch, row = 2
+                                     1.5,
+                                     3.,
+                                     4.5,
+                                     6.,  // second batch, row = 1
+                                     1.5,
+                                     3.,
+                                     4.5,
+                                     6.,  // second batch, row = 2
+                                 },
+                                 0.0316)));
 }
 
 TEST_P(ConvolutionOpTest, SimpleTestHybridInt8) {
@@ -1375,16 +1903,37 @@ TEST_P(ConvolutionOpTest, SimpleTestHybridInt8) {
 
   m.SetInput({
       // First batch
-      1, 1, 1, 1,  // row = 1
-      2, 2, 2, 2,  // row = 2
+      1,
+      1,
+      1,
+      1,  // row = 1
+      2,
+      2,
+      2,
+      2,  // row = 2
       // Second batch
-      1, 2, 3, 4,  // row = 1
-      1, 2, 3, 4,  // row = 2
+      1,
+      2,
+      3,
+      4,  // row = 1
+      1,
+      2,
+      3,
+      4,  // row = 2
   });
   m.SetSignedFilter({
-      1, 2, 3, 4,    // first 2x2 filter
-      -1, 1, -1, 1,  // second 2x2 filter
-      -1, -1, 1, 1,  // third 2x2 filter
+      1,
+      2,
+      3,
+      4,  // first 2x2 filter
+      -1,
+      1,
+      -1,
+      1,  // second 2x2 filter
+      -1,
+      -1,
+      1,
+      1,  // third 2x2 filter
   });
   m.SetBias({1, 2, 3});
 
@@ -1414,10 +1963,18 @@ TEST_P(ConvolutionOpTest, SimpleTestHybridInt8) {
   // and multiplies it with the filter directly.
   EXPECT_THAT(m.GetOutput(), ElementsAreArray(ArrayFloatNear(
                                  {
-                                     18, 2, 5,  // first batch, left
-                                     18, 2, 5,  // first batch, right
-                                     17, 4, 3,  // second batch, left
-                                     37, 4, 3,  // second batch, right
+                                     18,
+                                     2,
+                                     5,  // first batch, left
+                                     18,
+                                     2,
+                                     5,  // first batch, right
+                                     17,
+                                     4,
+                                     3,  // second batch, left
+                                     37,
+                                     4,
+                                     3,  // second batch, right
                                  },
                                  0.16)));
 }
@@ -1430,16 +1987,37 @@ TEST_P(ConvolutionOpTest, SimpleTestHybridInt4) {
 
   m.SetInput({
       // First batch
-      1, 1, 1, 1,  // row = 1
-      2, 2, 2, 2,  // row = 2
+      1,
+      1,
+      1,
+      1,  // row = 1
+      2,
+      2,
+      2,
+      2,  // row = 2
       // Second batch
-      1, 2, 3, 4,  // row = 1
-      1, 2, 3, 4,  // row = 2
+      1,
+      2,
+      3,
+      4,  // row = 1
+      1,
+      2,
+      3,
+      4,  // row = 2
   });
   m.SetSignedFilter({
-      1, 2, 3, 4,    // first 2x2 filter
-      -1, 1, -1, 1,  // second 2x2 filter
-      -1, -1, 1, 1,  // third 2x2 filter
+      1,
+      2,
+      3,
+      4,  // first 2x2 filter
+      -1,
+      1,
+      -1,
+      1,  // second 2x2 filter
+      -1,
+      -1,
+      1,
+      1,  // third 2x2 filter
   });
   m.SetBias({1, 2, 3});
 
@@ -1447,10 +2025,18 @@ TEST_P(ConvolutionOpTest, SimpleTestHybridInt4) {
 
   EXPECT_THAT(m.GetOutput(), ElementsAreArray(ArrayFloatNear(
                                  {
-                                     18, 2, 5,  // first batch, left
-                                     18, 2, 5,  // first batch, right
-                                     17, 4, 3,  // second batch, left
-                                     36, 4, 3,  // second batch, right
+                                     18,
+                                     2,
+                                     5,  // first batch, left
+                                     18,
+                                     2,
+                                     5,  // first batch, right
+                                     17,
+                                     4,
+                                     3,  // second batch, left
+                                     36,
+                                     4,
+                                     3,  // second batch, right
                                  },
                                  0.45)));
 }
@@ -1471,16 +2057,37 @@ TEST_P(ConvolutionOpTest, SimpleTestHybridInt8WithDilation) {
 
   m.SetInput({
       // First batch
-      1, 1, 1, 1,  // row = 1
-      2, 2, 2, 2,  // row = 2
+      1,
+      1,
+      1,
+      1,  // row = 1
+      2,
+      2,
+      2,
+      2,  // row = 2
       // Second batch
-      1, 2, 3, 4,  // row = 1
-      1, 2, 3, 4,  // row = 2
+      1,
+      2,
+      3,
+      4,  // row = 1
+      1,
+      2,
+      3,
+      4,  // row = 2
   });
   m.SetSignedFilter({
-      1, 2, 3, 4,    // first 2x2 filter
-      -1, 1, -1, 1,  // second 2x2 filter
-      -1, -1, 1, 1,  // third 2x2 filter
+      1,
+      2,
+      3,
+      4,  // first 2x2 filter
+      -1,
+      1,
+      -1,
+      1,  // second 2x2 filter
+      -1,
+      -1,
+      1,
+      1,  // third 2x2 filter
   });
   m.SetBias({1, 2, 3});
 
@@ -1510,10 +2117,18 @@ TEST_P(ConvolutionOpTest, SimpleTestHybridInt8WithDilation) {
   // and multiplies it with the filter directly.
   EXPECT_THAT(m.GetOutput(), ElementsAreArray(ArrayFloatNear(
                                  {
-                                     18, 2, 5,  // first batch, left
-                                     18, 2, 5,  // first batch, right
-                                     23, 6, 3,  // second batch, left
-                                     33, 6, 3,  // second batch, right
+                                     18,
+                                     2,
+                                     5,  // first batch, left
+                                     18,
+                                     2,
+                                     5,  // first batch, right
+                                     23,
+                                     6,
+                                     3,  // second batch, left
+                                     33,
+                                     6,
+                                     3,  // second batch, right
                                  },
                                  0.16)));
 }
@@ -1528,11 +2143,23 @@ TEST_P(ConvolutionOpTest, SimpleTestHybridInt8Big) {
 
   m.SetInput({
       // First batch
-      1, 1, 1, 1,  // row = 1
-      2, 2, 2, 2,  // row = 2
+      1,
+      1,
+      1,
+      1,  // row = 1
+      2,
+      2,
+      2,
+      2,  // row = 2
       // Second batch
-      1, 2, 3, 4,  // row = 1
-      1, 2, 3, 4,  // row = 2
+      1,
+      2,
+      3,
+      4,  // row = 1
+      1,
+      2,
+      3,
+      4,  // row = 2
   });
   m.SetSignedFilter({
       1,  2,  3,  4,   // first 2x2 filter
@@ -1599,10 +2226,18 @@ TEST_P(ConvolutionOpTest, SimpleTestHybridWithChannelsInt8) {
 
   EXPECT_THAT(m.GetOutput(), ElementsAreArray(ArrayFloatNear(
                                  {
-                                     18, 2, 5,  // first batch, left
-                                     18, 2, 5,  // first batch, right
-                                     17, 4, 3,  // second batch, left
-                                     37, 4, 3,  // second batch, right
+                                     18,
+                                     2,
+                                     5,  // first batch, left
+                                     18,
+                                     2,
+                                     5,  // first batch, right
+                                     17,
+                                     4,
+                                     3,  // second batch, left
+                                     37,
+                                     4,
+                                     3,  // second batch, right
                                  },
                                  0.16)));
 }
@@ -1623,7 +2258,8 @@ TEST_P(ConvolutionOpTest, PointwiseHybridInt8) {
   });
 
   m.SetSignedFilter({
-      1, 2,  // first filter
+      1,
+      2,  // first filter
   });
   m.SetBias({0});
 
@@ -1639,15 +2275,26 @@ TEST_P(ConvolutionOpTest, PointwiseHybridInt8) {
   // 64 127 with scale factor of 127/2.
   //
   // (64 * 64 + 64 * 127) * (2/127)^2 gives us the expected result.
-  EXPECT_THAT(m.GetOutput(),
-              ElementsAreArray(ArrayFloatNear(
-                  {
-                      1.5, 1.5, 1.5, 1.5,  // first batch, row = 1
-                      3., 3., 3., 3.,      // first batch, row = 2
-                      1.5, 3., 4.5, 6.,    // second batch, row = 1
-                      1.5, 3., 4.5, 6.,    // second batch, row = 2
-                  },
-                  0.0316)));
+  EXPECT_THAT(m.GetOutput(), ElementsAreArray(ArrayFloatNear(
+                                 {
+                                     1.5,
+                                     1.5,
+                                     1.5,
+                                     1.5,  // first batch, row = 1
+                                     3.,
+                                     3.,
+                                     3.,
+                                     3.,  // first batch, row = 2
+                                     1.5,
+                                     3.,
+                                     4.5,
+                                     6.,  // second batch, row = 1
+                                     1.5,
+                                     3.,
+                                     4.5,
+                                     6.,  // second batch, row = 2
+                                 },
+                                 0.0316)));
 }
 
 // TODO(alanchiao): this passes locally, but fails on continuous build system.
@@ -1667,8 +2314,10 @@ TEST_P(ConvolutionOpTest, DISABLED_PointwiseMultifilterHybrid) {
   });
 
   m.SetFilter({
-      1, 2,  // first filter
-      2, 3,  // second filter
+      1,
+      2,  // first filter
+      2,
+      3,  // second filter
   });
   m.SetBias({0});
 
@@ -1754,24 +2403,38 @@ TEST_P(ConvolutionOpTest, SimplePerTensorTest) {
       /*stride_width=*/1, /*stride_height=*/1);
   m.SetInput<int8_t>({
       // [1 * 2 * 3 * 2] as [batch, y, x, input_channel]
-      3, 2,    // batch = 0, y = 0, x = 0
-      1, -1,   // batch = 0, y = 0, x = 1
-      -2, -3,  // batch = 0, y = 0, x = 2
-      4, 3,    // batch = 0, y = 1, x = 0
-      2, -2,   // batch = 0, y = 1, x = 1
-      -3, -4,  // batch = 0, y = 1, x = 2
+      3,
+      2,  // batch = 0, y = 0, x = 0
+      1,
+      -1,  // batch = 0, y = 0, x = 1
+      -2,
+      -3,  // batch = 0, y = 0, x = 2
+      4,
+      3,  // batch = 0, y = 1, x = 0
+      2,
+      -2,  // batch = 0, y = 1, x = 1
+      -3,
+      -4,  // batch = 0, y = 1, x = 2
   });
   m.SetFilter(
       // [2 * 2 * 2 * 2] as [output_channel, y, x, input_channel]
       {
-          1, 2,  // out channel = 0, y = 0, x = 0
-          3, 4,  // out channel = 0, y = 0, x = 1
-          3, 4,  // out channel = 0, y = 1, x = 0
-          5, 6,  // out channel = 0, y = 1, x = 1
-          7, 8,  // out channel = 1, y = 0, x = 0
-          5, 6,  // out channel = 1, y = 0, x = 1
-          3, 4,  // out channel = 1, y = 1, x = 0
-          1, 2,  // out channel = 1, y = 1, x = 1
+          1,
+          2,  // out channel = 0, y = 0, x = 0
+          3,
+          4,  // out channel = 0, y = 0, x = 1
+          3,
+          4,  // out channel = 0, y = 1, x = 0
+          5,
+          6,  // out channel = 0, y = 1, x = 1
+          7,
+          8,  // out channel = 1, y = 0, x = 0
+          5,
+          6,  // out channel = 1, y = 0, x = 1
+          3,
+          4,  // out channel = 1, y = 1, x = 0
+          1,
+          2,  // out channel = 1, y = 1, x = 1
       });
   m.SetBias({3, -2});
 
@@ -1801,24 +2464,38 @@ TEST_P(ConvolutionOpTest, SimplePerTensorTest4bit) {
       /*stride_width=*/1, /*stride_height=*/1);
   m.SetInput<int8_t>({
       // [1 * 2 * 3 * 2] as [batch, y, x, input_channel]
-      3, 2,    // batch = 0, y = 0, x = 0
-      1, -1,   // batch = 0, y = 0, x = 1
-      -2, -3,  // batch = 0, y = 0, x = 2
-      4, 3,    // batch = 0, y = 1, x = 0
-      2, -2,   // batch = 0, y = 1, x = 1
-      -3, -4,  // batch = 0, y = 1, x = 2
+      3,
+      2,  // batch = 0, y = 0, x = 0
+      1,
+      -1,  // batch = 0, y = 0, x = 1
+      -2,
+      -3,  // batch = 0, y = 0, x = 2
+      4,
+      3,  // batch = 0, y = 1, x = 0
+      2,
+      -2,  // batch = 0, y = 1, x = 1
+      -3,
+      -4,  // batch = 0, y = 1, x = 2
   });
   m.SetFilter(
       // [2 * 2 * 2 * 2] as [output_channel, y, x, input_channel]
       {
-          1, 2,  // out channel = 0, y = 0, x = 0
-          3, 4,  // out channel = 0, y = 0, x = 1
-          3, 4,  // out channel = 0, y = 1, x = 0
-          5, 6,  // out channel = 0, y = 1, x = 1
-          7, 7,  // out channel = 1, y = 0, x = 0
-          5, 6,  // out channel = 1, y = 0, x = 1
-          3, 4,  // out channel = 1, y = 1, x = 0
-          1, 2,  // out channel = 1, y = 1, x = 1
+          1,
+          2,  // out channel = 0, y = 0, x = 0
+          3,
+          4,  // out channel = 0, y = 0, x = 1
+          3,
+          4,  // out channel = 0, y = 1, x = 0
+          5,
+          6,  // out channel = 0, y = 1, x = 1
+          7,
+          7,  // out channel = 1, y = 0, x = 0
+          5,
+          6,  // out channel = 1, y = 0, x = 1
+          3,
+          4,  // out channel = 1, y = 1, x = 0
+          1,
+          2,  // out channel = 1, y = 1, x = 1
       });
   m.SetBias({3, -2});
 
@@ -1848,24 +2525,38 @@ TEST_P(ConvolutionOpTest, SimplePerChannelTest) {
       /*stride_width=*/1, /*stride_height=*/1);
   m.SetInput<int8_t>({
       // [1 * 2 * 3 * 2] as [batch, y, x, input_channel]
-      3, 2,    // batch = 0, y = 0, x = 0
-      1, -1,   // batch = 0, y = 0, x = 1
-      -2, -3,  // batch = 0, y = 0, x = 2
-      4, 3,    // batch = 0, y = 1, x = 0
-      2, -2,   // batch = 0, y = 1, x = 1
-      -3, -4,  // batch = 0, y = 1, x = 2
+      3,
+      2,  // batch = 0, y = 0, x = 0
+      1,
+      -1,  // batch = 0, y = 0, x = 1
+      -2,
+      -3,  // batch = 0, y = 0, x = 2
+      4,
+      3,  // batch = 0, y = 1, x = 0
+      2,
+      -2,  // batch = 0, y = 1, x = 1
+      -3,
+      -4,  // batch = 0, y = 1, x = 2
   });
   m.SetFilter(
       // [2 * 2 * 2 * 2] as [output_channel, y, x, input_channel]
       {
-          1, 2,  // out channel = 0, y = 0, x = 0
-          3, 4,  // out channel = 0, y = 0, x = 1
-          3, 4,  // out channel = 0, y = 1, x = 0
-          5, 6,  // out channel = 0, y = 1, x = 1
-          7, 8,  // out channel = 1, y = 0, x = 0
-          5, 6,  // out channel = 1, y = 0, x = 1
-          3, 4,  // out channel = 1, y = 1, x = 0
-          1, 2,  // out channel = 1, y = 1, x = 1
+          1,
+          2,  // out channel = 0, y = 0, x = 0
+          3,
+          4,  // out channel = 0, y = 0, x = 1
+          3,
+          4,  // out channel = 0, y = 1, x = 0
+          5,
+          6,  // out channel = 0, y = 1, x = 1
+          7,
+          8,  // out channel = 1, y = 0, x = 0
+          5,
+          6,  // out channel = 1, y = 0, x = 1
+          3,
+          4,  // out channel = 1, y = 1, x = 0
+          1,
+          2,  // out channel = 1, y = 1, x = 1
       });
   m.SetBias({3, -2});
 
@@ -1904,24 +2595,38 @@ TEST_P(ConvolutionOpTest, SimplePerChannel16x8Bias32) {
 
   m.SetInput<int16_t>({
       // [1 * 2 * 3 * 2] as [batch, y, x, input_channel]
-      3, 2,    // batch = 0, y = 0, x = 0
-      1, -1,   // batch = 0, y = 0, x = 1
-      -2, -3,  // batch = 0, y = 0, x = 2
-      4, 3,    // batch = 0, y = 1, x = 0
-      2, -2,   // batch = 0, y = 1, x = 1
-      -3, -4,  // batch = 0, y = 1, x = 2
+      3,
+      2,  // batch = 0, y = 0, x = 0
+      1,
+      -1,  // batch = 0, y = 0, x = 1
+      -2,
+      -3,  // batch = 0, y = 0, x = 2
+      4,
+      3,  // batch = 0, y = 1, x = 0
+      2,
+      -2,  // batch = 0, y = 1, x = 1
+      -3,
+      -4,  // batch = 0, y = 1, x = 2
   });
   m.SetFilter(
       // [2 * 2 * 2 * 2] as [output_channel, y, x, input_channel]
       {
-          1, 2,  // out channel = 0, y = 0, x = 0
-          3, 4,  // out channel = 0, y = 0, x = 1
-          3, 4,  // out channel = 0, y = 1, x = 0
-          5, 6,  // out channel = 0, y = 1, x = 1
-          7, 8,  // out channel = 1, y = 0, x = 0
-          5, 6,  // out channel = 1, y = 0, x = 1
-          3, 4,  // out channel = 1, y = 1, x = 0
-          1, 2,  // out channel = 1, y = 1, x = 1
+          1,
+          2,  // out channel = 0, y = 0, x = 0
+          3,
+          4,  // out channel = 0, y = 0, x = 1
+          3,
+          4,  // out channel = 0, y = 1, x = 0
+          5,
+          6,  // out channel = 0, y = 1, x = 1
+          7,
+          8,  // out channel = 1, y = 0, x = 0
+          5,
+          6,  // out channel = 1, y = 0, x = 1
+          3,
+          4,  // out channel = 1, y = 1, x = 0
+          1,
+          2,  // out channel = 1, y = 1, x = 1
       });
   m.SetBias({3, -2});
 
@@ -1961,24 +2666,38 @@ TEST_P(ConvolutionOpTest, SimplePerChannel16x4Bias32) {
 
   m.SetInput<int16_t>({
       // [1 * 2 * 3 * 2] as [batch, y, x, input_channel]
-      3, 2,    // batch = 0, y = 0, x = 0
-      1, -1,   // batch = 0, y = 0, x = 1
-      -2, -3,  // batch = 0, y = 0, x = 2
-      4, 3,    // batch = 0, y = 1, x = 0
-      2, -2,   // batch = 0, y = 1, x = 1
-      -3, -4,  // batch = 0, y = 1, x = 2
+      3,
+      2,  // batch = 0, y = 0, x = 0
+      1,
+      -1,  // batch = 0, y = 0, x = 1
+      -2,
+      -3,  // batch = 0, y = 0, x = 2
+      4,
+      3,  // batch = 0, y = 1, x = 0
+      2,
+      -2,  // batch = 0, y = 1, x = 1
+      -3,
+      -4,  // batch = 0, y = 1, x = 2
   });
   m.SetFilter(
       // [2 * 2 * 2 * 2] as [output_channel, y, x, input_channel]
       {
-          1, 2,  // out channel = 0, y = 0, x = 0
-          3, 4,  // out channel = 0, y = 0, x = 1
-          3, 4,  // out channel = 0, y = 1, x = 0
-          5, 6,  // out channel = 0, y = 1, x = 1
-          7, 7,  // out channel = 1, y = 0, x = 0
-          5, 6,  // out channel = 1, y = 0, x = 1
-          3, 4,  // out channel = 1, y = 1, x = 0
-          1, 2,  // out channel = 1, y = 1, x = 1
+          1,
+          2,  // out channel = 0, y = 0, x = 0
+          3,
+          4,  // out channel = 0, y = 0, x = 1
+          3,
+          4,  // out channel = 0, y = 1, x = 0
+          5,
+          6,  // out channel = 0, y = 1, x = 1
+          7,
+          7,  // out channel = 1, y = 0, x = 0
+          5,
+          6,  // out channel = 1, y = 0, x = 1
+          3,
+          4,  // out channel = 1, y = 1, x = 0
+          1,
+          2,  // out channel = 1, y = 1, x = 1
       });
   m.SetBias({3, -2});
 
@@ -2018,24 +2737,38 @@ TEST_P(ConvolutionOpTest, SimplePerChannel16x8Bias64) {
 
   m.SetInput<int16_t>({
       // [1 * 2 * 3 * 2] as [batch, y, x, input_channel]
-      3, 2,    // batch = 0, y = 0, x = 0
-      1, -1,   // batch = 0, y = 0, x = 1
-      -2, -3,  // batch = 0, y = 0, x = 2
-      4, 3,    // batch = 0, y = 1, x = 0
-      2, -2,   // batch = 0, y = 1, x = 1
-      -3, -4,  // batch = 0, y = 1, x = 2
+      3,
+      2,  // batch = 0, y = 0, x = 0
+      1,
+      -1,  // batch = 0, y = 0, x = 1
+      -2,
+      -3,  // batch = 0, y = 0, x = 2
+      4,
+      3,  // batch = 0, y = 1, x = 0
+      2,
+      -2,  // batch = 0, y = 1, x = 1
+      -3,
+      -4,  // batch = 0, y = 1, x = 2
   });
   m.SetFilter(
       // [2 * 2 * 2 * 2] as [output_channel, y, x, input_channel]
       {
-          1, 2,  // out channel = 0, y = 0, x = 0
-          3, 4,  // out channel = 0, y = 0, x = 1
-          3, 4,  // out channel = 0, y = 1, x = 0
-          5, 6,  // out channel = 0, y = 1, x = 1
-          7, 8,  // out channel = 1, y = 0, x = 0
-          5, 6,  // out channel = 1, y = 0, x = 1
-          3, 4,  // out channel = 1, y = 1, x = 0
-          1, 2,  // out channel = 1, y = 1, x = 1
+          1,
+          2,  // out channel = 0, y = 0, x = 0
+          3,
+          4,  // out channel = 0, y = 0, x = 1
+          3,
+          4,  // out channel = 0, y = 1, x = 0
+          5,
+          6,  // out channel = 0, y = 1, x = 1
+          7,
+          8,  // out channel = 1, y = 0, x = 0
+          5,
+          6,  // out channel = 1, y = 0, x = 1
+          3,
+          4,  // out channel = 1, y = 1, x = 0
+          1,
+          2,  // out channel = 1, y = 1, x = 1
       });
   m.SetBias({3, -2});
 
@@ -2066,24 +2799,38 @@ TEST_P(ConvolutionOpTest, Simple4bitPerChannelTest) {
       /*stride_width=*/1, /*stride_height=*/1);
   m.SetInput<int8_t>({
       // [1 * 2 * 3 * 2] as [batch, y, x, input_channel]
-      3, 2,    // batch = 0, y = 0, x = 0
-      1, -1,   // batch = 0, y = 0, x = 1
-      -2, -3,  // batch = 0, y = 0, x = 2
-      4, 3,    // batch = 0, y = 1, x = 0
-      2, -2,   // batch = 0, y = 1, x = 1
-      -3, -4,  // batch = 0, y = 1, x = 2
+      3,
+      2,  // batch = 0, y = 0, x = 0
+      1,
+      -1,  // batch = 0, y = 0, x = 1
+      -2,
+      -3,  // batch = 0, y = 0, x = 2
+      4,
+      3,  // batch = 0, y = 1, x = 0
+      2,
+      -2,  // batch = 0, y = 1, x = 1
+      -3,
+      -4,  // batch = 0, y = 1, x = 2
   });
   m.SetFilter(
       // [2 * 2 * 2 * 2] as [output_channel, y, x, input_channel]
       {
-          1, 2,  // out channel = 0, y = 0, x = 0
-          3, 4,  // out channel = 0, y = 0, x = 1
-          3, 4,  // out channel = 0, y = 1, x = 0
-          5, 6,  // out channel = 0, y = 1, x = 1
-          7, 8,  // out channel = 1, y = 0, x = 0
-          5, 6,  // out channel = 1, y = 0, x = 1
-          3, 4,  // out channel = 1, y = 1, x = 0
-          1, 2,  // out channel = 1, y = 1, x = 1
+          1,
+          2,  // out channel = 0, y = 0, x = 0
+          3,
+          4,  // out channel = 0, y = 0, x = 1
+          3,
+          4,  // out channel = 0, y = 1, x = 0
+          5,
+          6,  // out channel = 0, y = 1, x = 1
+          7,
+          8,  // out channel = 1, y = 0, x = 0
+          5,
+          6,  // out channel = 1, y = 0, x = 1
+          3,
+          4,  // out channel = 1, y = 1, x = 0
+          1,
+          2,  // out channel = 1, y = 1, x = 1
       });
   m.SetBias({3, -2});
 
@@ -2156,10 +2903,18 @@ TEST_P(ConvolutionOpTest, SimpleTestHybridPerChannel) {
 
   EXPECT_THAT(m.GetOutput(), ElementsAreArray(ArrayFloatNear(
                                  {
-                                     18, 2, 5,  // first batch, left
-                                     18, 2, 5,  // first batch, right
-                                     17, 4, 3,  // second batch, left
-                                     37, 4, 3,  // second batch, right
+                                     18,
+                                     2,
+                                     5,  // first batch, left
+                                     18,
+                                     2,
+                                     5,  // first batch, right
+                                     17,
+                                     4,
+                                     3,  // second batch, left
+                                     37,
+                                     4,
+                                     3,  // second batch, right
                                  },
                                  0.16)));
 }
@@ -2200,10 +2955,18 @@ TEST_P(ConvolutionOpTest, SimpleTestHybridPerChannelInt4) {
 
   EXPECT_THAT(m.GetOutput(), ElementsAreArray(ArrayFloatNear(
                                  {
-                                     18, 2, 5,  // first batch, left
-                                     18, 2, 5,  // first batch, right
-                                     16, 4, 3,  // second batch, left
-                                     36, 4, 3,  // second batch, right
+                                     18,
+                                     2,
+                                     5,  // first batch, left
+                                     18,
+                                     2,
+                                     5,  // first batch, right
+                                     16,
+                                     4,
+                                     3,  // second batch, left
+                                     36,
+                                     4,
+                                     3,  // second batch, right
                                  },
                                  0.45)));
 }
@@ -2245,10 +3008,22 @@ TEST_P(ConvolutionOpTest, SimpleTestHybridPerChannelGrouped) {
 
   EXPECT_THAT(m.GetOutput(), ElementsAreArray(ArrayFloatNear(
                                  {
-                                     18, 2, 5, 2,  //
-                                     18, 2, 5, 2,  //
-                                     17, 4, 3, 4,  //
-                                     37, 4, 3, 4,  //
+                                     18,
+                                     2,
+                                     5,
+                                     2,  //
+                                     18,
+                                     2,
+                                     5,
+                                     2,  //
+                                     17,
+                                     4,
+                                     3,
+                                     4,  //
+                                     37,
+                                     4,
+                                     3,
+                                     4,  //
                                  },
                                  0.16)));
 }
@@ -2321,16 +3096,37 @@ TEST_P(ConvolutionOpTest, SimpleTestHybridWithDilationPerChannel) {
 
   m.SetInput({
       // First batch
-      1, 1, 1, 1,  // row = 1
-      2, 2, 2, 2,  // row = 2
+      1,
+      1,
+      1,
+      1,  // row = 1
+      2,
+      2,
+      2,
+      2,  // row = 2
       // Second batch
-      1, 2, 3, 4,  // row = 1
-      1, 2, 3, 4,  // row = 2
+      1,
+      2,
+      3,
+      4,  // row = 1
+      1,
+      2,
+      3,
+      4,  // row = 2
   });
   m.SetSignedFilter({
-      1, 2, 3, 4,    // first 2x2 filter
-      -1, 1, -1, 1,  // second 2x2 filter
-      -1, -1, 1, 1,  // third 2x2 filter
+      1,
+      2,
+      3,
+      4,  // first 2x2 filter
+      -1,
+      1,
+      -1,
+      1,  // second 2x2 filter
+      -1,
+      -1,
+      1,
+      1,  // third 2x2 filter
   });
   m.SetBias({1, 2, 3});
 
@@ -2338,10 +3134,18 @@ TEST_P(ConvolutionOpTest, SimpleTestHybridWithDilationPerChannel) {
 
   EXPECT_THAT(m.GetOutput(), ElementsAreArray(ArrayFloatNear(
                                  {
-                                     18, 2, 5,  // first batch, left
-                                     18, 2, 5,  // first batch, right
-                                     23, 6, 3,  // second batch, left
-                                     33, 6, 3,  // second batch, right
+                                     18,
+                                     2,
+                                     5,  // first batch, left
+                                     18,
+                                     2,
+                                     5,  // first batch, right
+                                     23,
+                                     6,
+                                     3,  // second batch, left
+                                     33,
+                                     6,
+                                     3,  // second batch, right
                                  },
                                  0.16)));
 }
@@ -2366,36 +3170,72 @@ TEST_P(QuantizedConvolutionOpTest, SimpleTestExplicitQuantizedOp) {
                                 {TensorType_UINT8, {}, -127, 128});
   m.SetInput({
       // First batch
-      1, 1, 1, 1,  // row = 1
-      2, 2, 2, 2,  // row = 2
+      1,
+      1,
+      1,
+      1,  // row = 1
+      2,
+      2,
+      2,
+      2,  // row = 2
       // Second batch
-      1, 2, 3, 4,  // row = 1
-      1, 2, 3, 4,  // row = 2
+      1,
+      2,
+      3,
+      4,  // row = 1
+      1,
+      2,
+      3,
+      4,  // row = 2
   });
   m.SetFilter({
-      1, 2, 3, 4,    // first 2x2 filter
-      -1, 1, -1, 1,  // second 2x2 filter
-      -1, -1, 1, 1,  // third 2x2 filter
+      1,
+      2,
+      3,
+      4,  // first 2x2 filter
+      -1,
+      1,
+      -1,
+      1,  // second 2x2 filter
+      -1,
+      -1,
+      1,
+      1,  // third 2x2 filter
   });
   m.SetBias({1, 2, 3});
 
   ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
-  EXPECT_THAT(m.GetDequantizedOutput(),
-              ElementsAreArray(ArrayFloatNear(
-                  {
-                      18, 2, 5,  // first batch, left
-                      18, 2, 5,  // first batch, right
-                      17, 4, 3,  // second batch, left
-                      37, 4, 3,  // second batch, right
-                  },
-                  1e-5)));
+  EXPECT_THAT(m.GetDequantizedOutput(), ElementsAreArray(ArrayFloatNear(
+                                            {
+                                                18,
+                                                2,
+                                                5,  // first batch, left
+                                                18,
+                                                2,
+                                                5,  // first batch, right
+                                                17,
+                                                4,
+                                                3,  // second batch, left
+                                                37,
+                                                4,
+                                                3,  // second batch, right
+                                            },
+                                            1e-5)));
   // For good  measure, let's also verify the quantized values:
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({
-                                 145, 129, 132,  //
-                                 145, 129, 132,  //
-                                 144, 131, 130,  //
-                                 164, 131, 130,  //
+                                 145,
+                                 129,
+                                 132,  //
+                                 145,
+                                 129,
+                                 132,  //
+                                 144,
+                                 131,
+                                 130,  //
+                                 164,
+                                 131,
+                                 130,  //
                              }));
 }
 

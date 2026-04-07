@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
+#include <limits>
 #include <vector>
 
 #include "tensorflow/lite/core/c/builtin_op_data.h"
@@ -64,6 +66,40 @@ void* Init(TfLiteContext* context, const char* buffer, size_t length) {
 void Free(TfLiteContext* context, void* buffer) {
   delete static_cast<OpData*>(buffer);
 }
+
+namespace {
+
+constexpr const char* kConv3dNegativeDimensionError =
+    "Conv3D encountered a negative dimension.";
+
+TfLiteStatus CheckedShapeProduct(TfLiteContext* context,
+                                 std::initializer_list<int> dims,
+                                 const char* error_message, size_t* product) {
+  const absl::Span<const int> dims_span(dims.begin(), dims.size());
+  for (const int dim : dims_span) {
+    TF_LITE_ENSURE_MSG(context, dim >= 0, "%s", kConv3dNegativeDimensionError);
+  }
+  TF_LITE_ENSURE_MSG(context,
+                     CheckedNumElements(dims_span, product) == kTfLiteOk, "%s",
+                     error_message);
+  return kTfLiteOk;
+}
+
+TfLiteStatus CheckedShapeProductToInt(TfLiteContext* context,
+                                      std::initializer_list<int> dims,
+                                      const char* error_message, int* product) {
+  size_t checked_product = 0;
+  TF_LITE_ENSURE_OK(context, CheckedShapeProduct(context, dims, error_message,
+                                                 &checked_product));
+  TF_LITE_ENSURE_MSG(
+      context,
+      checked_product <= static_cast<size_t>(std::numeric_limits<int>::max()),
+      "%s", error_message);
+  *product = static_cast<int>(checked_product);
+  return kTfLiteOk;
+}
+
+}  // namespace
 
 TfLiteStatus AllocateTemporaryTensorsIfRequired(
     KernelType kernel_type, TfLiteContext* context, TfLiteNode* node,
@@ -170,9 +206,19 @@ TfLiteStatus Prepare(KernelType kernel_type, TfLiteContext* context,
   // Allocate temporary tensors.
   size_t input_type_size;
   TF_LITE_ENSURE_STATUS(GetSizeOfType(context, input->type, &input_type_size));
-  const size_t im2col_bytes = batches * out_depth * out_height * out_width *
-                              input_channel * filter_depth * filter_height *
-                              filter_width * input_type_size;
+  size_t im2col_elements = 0;
+  TF_LITE_ENSURE_OK(
+      context,
+      CheckedShapeProduct(
+          context,
+          {batches, out_depth, out_height, out_width, input_channel,
+           filter_depth, filter_height, filter_width},
+          "Conv3D im2col tensor has too many elements.", &im2col_elements));
+  size_t im2col_bytes = 0;
+  TF_LITE_ENSURE_MSG(context,
+                     MultiplyAndCheckOverflow(im2col_elements, input_type_size,
+                                              &im2col_bytes) == kTfLiteOk,
+                     "%s", "Conv3D im2col tensor is too large.");
   TF_LITE_ENSURE_OK(context, AllocateTemporaryTensorsIfRequired(
                                  kernel_type, context, node, opdata, params,
                                  filter, im2col_bytes));
@@ -183,8 +229,12 @@ TfLiteStatus Prepare(KernelType kernel_type, TfLiteContext* context,
     im2col_size->data[1] = output_size->data[1];
     im2col_size->data[2] = output_size->data[2];
     im2col_size->data[3] = output_size->data[3];
-    im2col_size->data[4] =
-        input_channel * filter_depth * filter_height * filter_width;
+    TF_LITE_ENSURE_OK(
+        context,
+        CheckedShapeProductToInt(
+            context, {input_channel, filter_depth, filter_height, filter_width},
+            "Conv3D im2col tensor has too many channels.",
+            &im2col_size->data[4]));
 
     TfLiteTensor* im2col;
     node->temporaries->data[opdata->im2col_index] = opdata->im2col_tensor_id;

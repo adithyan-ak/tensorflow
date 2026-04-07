@@ -29,6 +29,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "absl/types/span.h"
 #include "tensorflow/lite/array.h"
 #include "tensorflow/lite/core/c/common.h"
 #include "tensorflow/lite/schema/schema_generated.h"
@@ -97,6 +98,24 @@ bool IsValidationSubgraph(const char* name);
 // have unsigned numbers. It is also generalized to work where sizeof(size_t)
 // is not 8.
 TfLiteStatus MultiplyAndCheckOverflow(size_t a, size_t b, size_t* product);
+
+// Computes the number of elements described by the provided dimensions while
+// checking for negative sizes and size_t overflow.
+TfLiteStatus CheckedNumElements(absl::Span<const int> dims, size_t* count);
+
+inline TfLiteStatus CheckedNumElements(const TfLiteIntArray* dims,
+                                       size_t* count) {
+  if (dims == nullptr) return kTfLiteError;
+  return CheckedNumElements(
+      absl::Span<const int>(dims->data, static_cast<size_t>(dims->size)),
+      count);
+}
+
+inline TfLiteStatus CheckedNumElements(const TfLiteTensor* tensor,
+                                       size_t* count) {
+  if (tensor == nullptr) return kTfLiteError;
+  return CheckedNumElements(tensor->dims, count);
+}
 
 // Returns whether the TfLiteTensor is a resource or variant tensor.
 inline bool IsResourceOrVariant(const TfLiteTensor* tensor) {

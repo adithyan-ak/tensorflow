@@ -145,6 +145,47 @@ class DepthwiseConvolutionOpModel : public BaseDepthwiseConvolutionOpModel {
   std::vector<float> GetOutput() { return ExtractVector<float>(output_); }
 };
 
+class PrepareOnlyDepthwiseConvolutionOpModel : public SingleOpModel {
+ public:
+  PrepareOnlyDepthwiseConvolutionOpModel(
+      TfLiteRegistration* registration, const TensorData& input,
+      const TensorData& filter, const TensorData& output, Padding padding_type,
+      int dilation_factor = 1, int stride_width = 1, int stride_height = 1,
+      ActivationFunctionType fused_activation_function =
+          ActivationFunctionType_NONE) {
+    input_ = AddInput(input);
+    filter_ = AddInput(filter);
+
+    const int bias_size = GetShape(filter_)[3];
+    bias_ = AddInput({TensorType_FLOAT32, {bias_size}});
+    output_ = AddOutput(output);
+
+    const int input_depth = GetShape(input_)[3];
+    const int output_depth = GetShape(filter_)[3];
+    const int depth_mul = output_depth / input_depth;
+    SetBuiltinOp(
+        BuiltinOperator_DEPTHWISE_CONV_2D,
+        BuiltinOptions_DepthwiseConv2DOptions,
+        CreateDepthwiseConv2DOptions(
+            builder_, padding_type, stride_width, stride_height, depth_mul,
+            fused_activation_function, dilation_factor, dilation_factor)
+            .Union());
+
+    resolver_ = std::make_unique<SingleOpResolver>(
+        BuiltinOperator_DEPTHWISE_CONV_2D, registration);
+    BuildInterpreter({GetShape(input_), GetShape(filter_), GetShape(bias_)},
+                     /*num_threads=*/1, /*allow_fp32_relax_to_fp16=*/false,
+                     /*apply_delegate=*/false,
+                     /*allocate_and_delegate=*/false);
+  }
+
+ private:
+  int input_;
+  int filter_;
+  int bias_;
+  int output_;
+};
+
 const auto kKernelMap = new std::map<string, TfLiteRegistration*>({
     {"Reference", ops::builtin::Register_DEPTHWISE_CONVOLUTION_REF()},
     {"GenericOptimized",
@@ -159,6 +200,28 @@ class DepthwiseConvolutionOpTest : public SingleOpTest {
   }
 };
 
+TEST(DepthwiseConvolutionPrepareSecurityTest, RejectsHybridInputOverflow) {
+  constexpr int kHugeDim = 46341;
+  PrepareOnlyDepthwiseConvolutionOpModel m(
+      ops::builtin::Register_DEPTHWISE_CONVOLUTION_GENERIC_OPT(),
+      {TensorType_FLOAT32, {kHugeDim, kHugeDim, 1, 1}},
+      {TensorType_INT8, {1, 1, 1, 1}, -1.0f, 1.0f}, {TensorType_FLOAT32, {}},
+      Padding_VALID);
+
+  EXPECT_EQ(m.AllocateTensors(), kTfLiteError);
+}
+
+TEST(DepthwiseConvolutionPrepareSecurityTest, RejectsInt4FilterSizeOverflow) {
+  constexpr int kHugeDim = 46341;
+  PrepareOnlyDepthwiseConvolutionOpModel m(
+      ops::builtin::Register_DEPTHWISE_CONVOLUTION_GENERIC_OPT(),
+      {TensorType_FLOAT32, {1, kHugeDim, 1, 1}},
+      {TensorType_INT4, {1, kHugeDim, 1, kHugeDim}, 0.0f, 0.0f, 1.0f, 0},
+      {TensorType_FLOAT32, {}}, Padding_VALID);
+
+  EXPECT_EQ(m.AllocateTensors(), kTfLiteError);
+}
+
 TEST_P(DepthwiseConvolutionOpTest, ActivationReluTest) {
   DepthwiseConvolutionOpModel m(
       GetRegistration(), {TensorType_FLOAT32, {1, 3, 2, 2}},
@@ -170,23 +233,50 @@ TEST_P(DepthwiseConvolutionOpTest, ActivationReluTest) {
       /*ActivationFunctionType*/ ActivationFunctionType_RELU);
 
   m.SetInput({
-      1, 2, 7, 8,    // column 1
-      3, 4, 9, 10,   // column 2
-      5, 6, 11, 12,  // column 3
+      1,
+      2,
+      7,
+      8,  // column 1
+      3,
+      4,
+      9,
+      10,  // column 2
+      5,
+      6,
+      11,
+      12,  // column 3
   });
   m.SetFilter({
-      1, 2, 3, 4,        //
-      -9, 10, -11, 12,   //
-      5, 6, 7, 8,        //
-      13, -14, 15, -16,  //
+      1,
+      2,
+      3,
+      4,  //
+      -9,
+      10,
+      -11,
+      12,  //
+      5,
+      6,
+      7,
+      8,  //
+      13,
+      -14,
+      15,
+      -16,  //
   });
   m.SetBias({1, 2, 3, 4});
 
   ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({
-                                 71, 0, 99, 0,   //
-                                 91, 0, 127, 0,  //
+                                 71,
+                                 0,
+                                 99,
+                                 0,  //
+                                 91,
+                                 0,
+                                 127,
+                                 0,  //
                              }));
 }
 
@@ -201,23 +291,50 @@ TEST_P(DepthwiseConvolutionOpTest, ActivationReluN1Test) {
       /*ActivationFunctionType*/ ActivationFunctionType_RELU_N1_TO_1);
 
   m.SetInput({
-      1, 2, 7, 8,    // column 1
-      3, 4, 9, 10,   // column 2
-      5, 6, 11, 12,  // column 3
+      1,
+      2,
+      7,
+      8,  // column 1
+      3,
+      4,
+      9,
+      10,  // column 2
+      5,
+      6,
+      11,
+      12,  // column 3
   });
   m.SetFilter({
-      1, 2, 3, 4,        //
-      -9, 10, -11, 12,   //
-      5, 6, 7, 8,        //
-      13, -14, 15, -16,  //
+      1,
+      2,
+      3,
+      4,  //
+      -9,
+      10,
+      -11,
+      12,  //
+      5,
+      6,
+      7,
+      8,  //
+      13,
+      -14,
+      15,
+      -16,  //
   });
   m.SetBias({1, 2, 3, 4});
 
   ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({
-                                 1, -1, 1, -1,  //
-                                 1, -1, 1, -1,  //
+                                 1,
+                                 -1,
+                                 1,
+                                 -1,  //
+                                 1,
+                                 -1,
+                                 1,
+                                 -1,  //
                              }));
 }
 
@@ -232,23 +349,50 @@ TEST_P(DepthwiseConvolutionOpTest, ActivationRelu6Test) {
       /*ActivationFunctionType*/ ActivationFunctionType_RELU6);
 
   m.SetInput({
-      1, 2, 7, 8,    // column 1
-      3, 4, 9, 10,   // column 2
-      5, 6, 11, 12,  // column 3
+      1,
+      2,
+      7,
+      8,  // column 1
+      3,
+      4,
+      9,
+      10,  // column 2
+      5,
+      6,
+      11,
+      12,  // column 3
   });
   m.SetFilter({
-      1, 2, 3, 4,        //
-      -9, 10, -11, 12,   //
-      5, 6, 7, 8,        //
-      13, -14, 15, -16,  //
+      1,
+      2,
+      3,
+      4,  //
+      -9,
+      10,
+      -11,
+      12,  //
+      5,
+      6,
+      7,
+      8,  //
+      13,
+      -14,
+      15,
+      -16,  //
   });
   m.SetBias({1, 2, 3, 4});
 
   ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({
-                                 6, 0, 6, 0,  //
-                                 6, 0, 6, 0,  //
+                                 6,
+                                 0,
+                                 6,
+                                 0,  //
+                                 6,
+                                 0,
+                                 6,
+                                 0,  //
                              }));
 }
 
@@ -263,22 +407,46 @@ void StrideTest(TfLiteRegistration* registration, int num_thread) {
       /*ActivationFunctionType*/ ActivationFunctionType_NONE);
 
   m.SetInput({
-      1, 2, 7, 8,    // column 1
-      3, 4, 9, 10,   // column 2
-      5, 6, 11, 12,  // column 3
+      1,
+      2,
+      7,
+      8,  // column 1
+      3,
+      4,
+      9,
+      10,  // column 2
+      5,
+      6,
+      11,
+      12,  // column 3
   });
   m.SetFilter({
-      1, 2, 3, 4,        //
-      -9, 10, -11, 12,   //
-      5, 6, 7, 8,        //
-      13, -14, 15, -16,  //
+      1,
+      2,
+      3,
+      4,  //
+      -9,
+      10,
+      -11,
+      12,  //
+      5,
+      6,
+      7,
+      8,  //
+      13,
+      -14,
+      15,
+      -16,  //
   });
   m.SetBias({1, 2, 3, 4});
 
   ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({
-                                 71, -34, 99, -20,  //
+                                 71,
+                                 -34,
+                                 99,
+                                 -20,  //
                              }));
 }
 
@@ -301,23 +469,50 @@ void PaddingTest(TfLiteRegistration* registration, int num_thread) {
       /*ActivationFunctionType*/ ActivationFunctionType_NONE);
 
   m.SetInput({
-      1, 2, 7, 8,    // column 1
-      3, 4, 9, 10,   // column 2
-      5, 6, 11, 12,  // column 3
+      1,
+      2,
+      7,
+      8,  // column 1
+      3,
+      4,
+      9,
+      10,  // column 2
+      5,
+      6,
+      11,
+      12,  // column 3
   });
   m.SetFilter({
-      1, 2, 3, 4,        //
-      -9, 10, -11, 12,   //
-      5, 6, 7, 8,        //
-      13, -14, 15, -16,  //
+      1,
+      2,
+      3,
+      4,  //
+      -9,
+      10,
+      -11,
+      12,  //
+      5,
+      6,
+      7,
+      8,  //
+      13,
+      -14,
+      15,
+      -16,  //
   });
   m.SetBias({1, 2, 3, 4});
 
   ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({
-                                 71, -34, 99, -20,     //
-                                 -93, 122, -111, 172,  //
+                                 71,
+                                 -34,
+                                 99,
+                                 -20,  //
+                                 -93,
+                                 122,
+                                 -111,
+                                 172,  //
                              }));
 }
 
@@ -336,23 +531,50 @@ void SimpleTest(TfLiteRegistration* registration, int num_thread) {
                                 {TensorType_FLOAT32, {}}, Padding_VALID);
 
   m.SetInput({
-      1, 2, 7, 8,    // column 1
-      3, 4, 9, 10,   // column 2
-      5, 6, 11, 12,  // column 3
+      1,
+      2,
+      7,
+      8,  // column 1
+      3,
+      4,
+      9,
+      10,  // column 2
+      5,
+      6,
+      11,
+      12,  // column 3
   });
   m.SetFilter({
-      1, 2, 3, 4,        //
-      -9, 10, -11, 12,   //
-      5, 6, 7, 8,        //
-      13, -14, 15, -16,  //
+      1,
+      2,
+      3,
+      4,  //
+      -9,
+      10,
+      -11,
+      12,  //
+      5,
+      6,
+      7,
+      8,  //
+      13,
+      -14,
+      15,
+      -16,  //
   });
   m.SetBias({1, 2, 3, 4});
 
   ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({
-                                 71, -34, 99, -20,  //
-                                 91, -26, 127, -4,  //
+                                 71,
+                                 -34,
+                                 99,
+                                 -20,  //
+                                 91,
+                                 -26,
+                                 127,
+                                 -4,  //
                              }));
 }
 
@@ -693,15 +915,36 @@ TEST_P(QuantizedDepthwiseConvolutionOpTest, SimpleTestQuantized) {
       {TensorType_UINT8, {}, -127, 128}, Padding_VALID);
 
   m.SetInput({
-      1, 2, 7, 8,    // column 1
-      3, 4, 9, 10,   // column 2
-      5, 6, 11, 12,  // column 3
+      1,
+      2,
+      7,
+      8,  // column 1
+      3,
+      4,
+      9,
+      10,  // column 2
+      5,
+      6,
+      11,
+      12,  // column 3
   });
   m.SetFilter({
-      1, 2, 3, 4,        //
-      -9, 10, -11, 12,   //
-      5, 6, 7, 8,        //
-      13, -14, 15, -16,  //
+      1,
+      2,
+      3,
+      4,  //
+      -9,
+      10,
+      -11,
+      12,  //
+      5,
+      6,
+      7,
+      8,  //
+      13,
+      -14,
+      15,
+      -16,  //
   });
   m.SetBias({1, 2, 3, 4});
 
@@ -709,14 +952,26 @@ TEST_P(QuantizedDepthwiseConvolutionOpTest, SimpleTestQuantized) {
 
   EXPECT_THAT(m.GetDequantizedOutput(), ElementsAreArray(ArrayFloatNear(
                                             {
-                                                71, -34, 99, -20,  //
-                                                91, -26, 127, -4,  //
+                                                71,
+                                                -34,
+                                                99,
+                                                -20,  //
+                                                91,
+                                                -26,
+                                                127,
+                                                -4,  //
                                             },
                                             1e-5)));
   // For good  measure, let's also verify the quantized values:
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({
-                                 198, 93, 226, 107,   //
-                                 218, 101, 254, 123,  //
+                                 198,
+                                 93,
+                                 226,
+                                 107,  //
+                                 218,
+                                 101,
+                                 254,
+                                 123,  //
                              }));
 }
 
@@ -1645,22 +1900,40 @@ TEST_P(PerChannelQuantizedDepthwiseConvolutionOpTest, SimplePerTensorTest) {
       {TensorType_INT8, {}, -63.5, 64, 0.5, -1}, Padding_VALID);
   m.SetInput({
       // [1 * 2 * 3 * 2] as [batch, y, x, input_channel]
-      3, 2,    // batch = 0, y = 0, x = 0
-      1, -1,   // batch = 0, y = 0, x = 1
-      -2, -3,  // batch = 0, y = 0, x = 2
-      4, 3,    // batch = 0, y = 1, x = 0
-      2, -2,   // batch = 0, y = 1, x = 1
-      -3, -4,  // batch = 0, y = 1, x = 2
+      3,
+      2,  // batch = 0, y = 0, x = 0
+      1,
+      -1,  // batch = 0, y = 0, x = 1
+      -2,
+      -3,  // batch = 0, y = 0, x = 2
+      4,
+      3,  // batch = 0, y = 1, x = 0
+      2,
+      -2,  // batch = 0, y = 1, x = 1
+      -3,
+      -4,  // batch = 0, y = 1, x = 2
   });
   m.SetFilter(
       /*filter data*/
       {
           // [1 * 2 * 2 * 4] as [input_channel, y, x, output_channel]
           // depth multiplier = 2
-          1, 2, 3, 4,  // y = 0, x = 0
-          3, 4, 5, 6,  // y = 0, x = 1
-          7, 8, 5, 6,  // y = 1, x = 0
-          3, 4, 1, 2,  // y = 1, x = 1
+          1,
+          2,
+          3,
+          4,  // y = 0, x = 0
+          3,
+          4,
+          5,
+          6,  // y = 0, x = 1
+          7,
+          8,
+          5,
+          6,  // y = 1, x = 0
+          3,
+          4,
+          1,
+          2,  // y = 1, x = 1
       });
   m.SetBias({3, -2, 4, 6});
 
@@ -1691,22 +1964,40 @@ TEST_P(PerChannelQuantizedDepthwiseConvolutionOpTest, SimplePerAxisTest) {
       {TensorType_INT8, {}, -63.5, 64, 0.5, -1}, Padding_VALID);
   m.SetInput({
       // [1 * 2 * 3 * 2] as [batch, y, x, input_channel]
-      3, 2,    // batch = 0, y = 0, x = 0
-      1, -1,   // batch = 0, y = 0, x = 1
-      -2, -3,  // batch = 0, y = 0, x = 2
-      4, 3,    // batch = 0, y = 1, x = 0
-      2, -2,   // batch = 0, y = 1, x = 1
-      -3, -4,  // batch = 0, y = 1, x = 2
+      3,
+      2,  // batch = 0, y = 0, x = 0
+      1,
+      -1,  // batch = 0, y = 0, x = 1
+      -2,
+      -3,  // batch = 0, y = 0, x = 2
+      4,
+      3,  // batch = 0, y = 1, x = 0
+      2,
+      -2,  // batch = 0, y = 1, x = 1
+      -3,
+      -4,  // batch = 0, y = 1, x = 2
   });
   m.SetFilter(
       /*filter data*/
       {
           // [1 * 2 * 2 * 4] as [input_channel, y, x, output_channel]
           // depth multiplier = 2
-          1, 2, 3, 4,  // y = 0, x = 0
-          3, 4, 5, 6,  // y = 0, x = 1
-          7, 8, 5, 6,  // y = 1, x = 0
-          3, 4, 1, 2,  // y = 1, x = 1
+          1,
+          2,
+          3,
+          4,  // y = 0, x = 0
+          3,
+          4,
+          5,
+          6,  // y = 0, x = 1
+          7,
+          8,
+          5,
+          6,  // y = 1, x = 0
+          3,
+          4,
+          1,
+          2,  // y = 1, x = 1
       });
   m.SetBias({3, -2, 4, 6});
 
@@ -1739,22 +2030,40 @@ TEST_P(PerChannelQuantizedDepthwiseConvolutionOpTest,
       {TensorType_INT8, {}, -63.5, 64, 0.5, -1}, Padding_VALID);
   m.SetInput({
       // [1 * 2 * 3 * 2] as [batch, y, x, input_channel]
-      3, 2,    // batch = 0, y = 0, x = 0
-      1, -1,   // batch = 0, y = 0, x = 1
-      -2, -3,  // batch = 0, y = 0, x = 2
-      4, 3,    // batch = 0, y = 1, x = 0
-      2, -2,   // batch = 0, y = 1, x = 1
-      -3, -4,  // batch = 0, y = 1, x = 2
+      3,
+      2,  // batch = 0, y = 0, x = 0
+      1,
+      -1,  // batch = 0, y = 0, x = 1
+      -2,
+      -3,  // batch = 0, y = 0, x = 2
+      4,
+      3,  // batch = 0, y = 1, x = 0
+      2,
+      -2,  // batch = 0, y = 1, x = 1
+      -3,
+      -4,  // batch = 0, y = 1, x = 2
   });
   m.SetFilter(
       /*filter data*/
       {
           // [1 * 2 * 2 * 4] as [input_channel, y, x, output_channel]
           // depth multiplier = 2
-          1, 2, 3, 4,  // y = 0, x = 0
-          3, 4, 5, 6,  // y = 0, x = 1
-          7, 8, 5, 6,  // y = 1, x = 0
-          3, 4, 1, 2,  // y = 1, x = 1
+          1,
+          2,
+          3,
+          4,  // y = 0, x = 0
+          3,
+          4,
+          5,
+          6,  // y = 0, x = 1
+          7,
+          8,
+          5,
+          6,  // y = 1, x = 0
+          3,
+          4,
+          1,
+          2,  // y = 1, x = 1
       });
   m.SetBias({3, -2, 4, 6});
 
@@ -1787,22 +2096,40 @@ TEST_P(PerChannelQuantizedDepthwiseConvolutionOpTest,
       {TensorType_INT8, {}, -63.5, 64, 0.5, -1}, Padding_VALID);
   m.SetInput({
       // [1 * 2 * 3 * 2] as [batch, y, x, input_channel]
-      3, 2,    // batch = 0, y = 0, x = 0
-      1, -1,   // batch = 0, y = 0, x = 1
-      -2, -3,  // batch = 0, y = 0, x = 2
-      4, 3,    // batch = 0, y = 1, x = 0
-      2, -2,   // batch = 0, y = 1, x = 1
-      -3, -4,  // batch = 0, y = 1, x = 2
+      3,
+      2,  // batch = 0, y = 0, x = 0
+      1,
+      -1,  // batch = 0, y = 0, x = 1
+      -2,
+      -3,  // batch = 0, y = 0, x = 2
+      4,
+      3,  // batch = 0, y = 1, x = 0
+      2,
+      -2,  // batch = 0, y = 1, x = 1
+      -3,
+      -4,  // batch = 0, y = 1, x = 2
   });
   m.SetFilter(
       /*filter data*/
       {
           // [1 * 2 * 2 * 4] as [input_channel, y, x, output_channel]
           // depth multiplier = 2
-          1, 2, 3, 4,  // y = 0, x = 0
-          3, 4, 5, 6,  // y = 0, x = 1
-          7, 8, 5, 6,  // y = 1, x = 0
-          3, 4, 1, 2,  // y = 1, x = 1
+          1,
+          2,
+          3,
+          4,  // y = 0, x = 0
+          3,
+          4,
+          5,
+          6,  // y = 0, x = 1
+          7,
+          8,
+          5,
+          6,  // y = 1, x = 0
+          3,
+          4,
+          1,
+          2,  // y = 1, x = 1
       });
   m.SetBias({3, -2, 4, 6});
 
@@ -1925,22 +2252,40 @@ TEST_P(PerChannelQuantizedDepthwiseConvolutionOpTest, Simple4bitPerAxisTest) {
       {TensorType_INT8, {}, -63.5, 64, 0.5, -1}, Padding_VALID);
   m.SetInput({
       // [1 * 2 * 3 * 2] as [batch, y, x, input_channel]
-      3, 2,    // batch = 0, y = 0, x = 0
-      1, -1,   // batch = 0, y = 0, x = 1
-      -2, -3,  // batch = 0, y = 0, x = 2
-      4, 3,    // batch = 0, y = 1, x = 0
-      2, -2,   // batch = 0, y = 1, x = 1
-      -3, -4,  // batch = 0, y = 1, x = 2
+      3,
+      2,  // batch = 0, y = 0, x = 0
+      1,
+      -1,  // batch = 0, y = 0, x = 1
+      -2,
+      -3,  // batch = 0, y = 0, x = 2
+      4,
+      3,  // batch = 0, y = 1, x = 0
+      2,
+      -2,  // batch = 0, y = 1, x = 1
+      -3,
+      -4,  // batch = 0, y = 1, x = 2
   });
   m.SetFilter(
       /*filter data*/
       {
           // [1 * 2 * 2 * 4] as [input_channel, y, x, output_channel]
           // depth multiplier = 2
-          1, 2, 3, 4,  // y = 0, x = 0
-          3, 4, 5, 6,  // y = 0, x = 1
-          7, 8, 5, 6,  // y = 1, x = 0
-          3, 4, 1, 2,  // y = 1, x = 1
+          1,
+          2,
+          3,
+          4,  // y = 0, x = 0
+          3,
+          4,
+          5,
+          6,  // y = 0, x = 1
+          7,
+          8,
+          5,
+          6,  // y = 1, x = 0
+          3,
+          4,
+          1,
+          2,  // y = 1, x = 1
       });
   m.SetBias({3, -2, 4, 6});
 
